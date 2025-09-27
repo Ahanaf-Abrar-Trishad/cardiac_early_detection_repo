@@ -90,7 +90,7 @@ python scripts/seg_cv.py --dataset camus --view 4CH --phase ED   --folds 5 --epo
 ```bash
 # Multiclass RV/MYO/LV, ED phase
 export PYTHONPATH=$(pwd)
-python scripts/seg_cv.py --dataset acdc --phase ED   --folds 5 --epochs 30 --batch-size 1 --lr 1e-3 --logdir logs   --acdc-multiclass --amp --feat3d 16,32,64,128
+python scripts/seg_cv.py --dataset acdc --phase ED   --folds 5 --epochs 60 --batch-size 1 --lr 1e-3 --logdir logs   --acdc-multiclass --amp --feat3d 16,32,64,128
 ```
 
 **Outputs**
