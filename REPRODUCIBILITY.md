@@ -1,6 +1,6 @@
 # Reproducibility
 
-- **Python** pinned in `environment.yml` (3.10). Use `conda env create -f environment.yml` then `conda activate <env>`.
+- **Python** pinned in `environment.yml` (3.11). Use `conda env create -f environment.yml` then `conda activate <env>`.
 - **Torch/CUDA**: install via `setup_cuda_pytorch.sh` to match your GPU (avoids wheel/driver mismatch).
 - **Seeds**: all training scripts set `torch`, `numpy`, and `random` seeds (default 42), and set CuDNN to deterministic.
 - **Exact splits**: patient-level CV splits are deterministic by `--seed`. Saved CSVs appear in `meta/` and metrics in `logs/`.
