@@ -94,7 +94,8 @@ reports: ## Run notebooks manually (open in Jupyter) and write to reports/ & rep
 	@echo "Open notebooks/cardiac_cls_report.ipynb and notebooks/cardiac_seg_report.ipynb and Run All."
 
 # ===== Convenience =====
-.PHONY: all clean
+.PHONY: all clean utility
 all: camus acdc splits seg2d seg3d features_acdc cls ## End-to-end (heavy)
 clean: ## Remove logs and reports
 	rm -rf logs logs_ef logs_vol reports reports_seg
+utility: extract-ef-camus extract-ef-acdc ablation tabular-cv torch-cv qc-report results ## Run utility scripts
