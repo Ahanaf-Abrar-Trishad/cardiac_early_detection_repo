@@ -9,9 +9,10 @@ Segmentation cross-validation (patient-level) for CAMUS (2D) and ACDC (3D).
 - Optional MLflow / W&B tracking.
 - Flags:
   * --feat2d / --feat3d to choose UNet widths
-  * --amp to enable mixed precision (torch.amp)
+  * --amp to enable mixed precision (torch.amp / cuda.amp via shim)
+  * --grad-clip, --accum, --num-workers for stability/perf
 """
-import argparse, json
+import argparse, json, random, math
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,21 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from sklearn.model_selection import GroupKFold
+
+# -------- AMP compat shim (new torch.amp API with fallback to cuda.amp) --------
+try:
+    from torch.amp import GradScaler as _GradScaler, autocast as _autocast
+    def make_scaler(enabled: bool):
+        # torch>=2.0
+        return _GradScaler('cuda', enabled=enabled)
+    def autocast_ctx(enabled: bool):
+        return _autocast('cuda', enabled=enabled)
+except Exception:  # pragma: no cover
+    from torch.cuda.amp import GradScaler as _GradScaler, autocast as _autocast
+    def make_scaler(enabled: bool):
+        return _GradScaler(enabled=enabled)
+    def autocast_ctx(enabled: bool):
+        return _autocast(enabled=enabled)
 
 # Optional experiment tracking
 try:
@@ -48,6 +64,26 @@ import matplotlib.pyplot as plt
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# ---------------- Small utils ----------------
+def set_all_seeds(seed=42):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+
+def cosine_with_warmup_lambda(T, warm=5, min_ratio=0.1):
+    def f(ep):
+        if ep < warm:
+            return (ep + 1) / max(1, warm)
+        t = (ep - warm) / max(1, (T - warm))
+        return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * t))
+    return f
+
+def loader_fast_kwargs(num_workers: int):
+    return dict(
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=2
+    )
 
 # ---------------- Models ----------------
 class DoubleConv2D(nn.Module):
@@ -219,7 +255,8 @@ def maybe_init_tracking(args):
         mlflow.log_params({
             "dataset": args.dataset, "phase": args.phase, "folds": args.folds,
             "epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr,
-            "seed": args.seed, "view": args.view, "feat2d": args.feat2d, "feat3d": args.feat3d, "amp": args.amp
+            "seed": args.seed, "view": args.view, "feat2d": args.feat2d, "feat3d": args.feat3d, "amp": args.amp,
+            "grad_clip": args.grad_clip, "accum": args.accum, "num_workers": args.num_workers
         })
     if args.wandb and _HAS_WANDB:
         run = wandb.init(
@@ -229,7 +266,8 @@ def maybe_init_tracking(args):
             config={
                 "dataset": args.dataset, "phase": args.phase, "folds": args.folds,
                 "epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr,
-                "seed": args.seed, "view": args.view, "feat2d": args.feat2d, "feat3d": args.feat3d, "amp": args.amp
+                "seed": args.seed, "view": args.view, "feat2d": args.feat2d, "feat3d": args.feat3d, "amp": args.amp,
+                "grad_clip": args.grad_clip, "accum": args.accum, "num_workers": args.num_workers
             }
         )
     return run
@@ -265,29 +303,43 @@ def run_fold_seg_2d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
     ds = CamusEDESDataset(args.meta, split="", view=args.view, phase=phase, aug=None)
     tr_set = Subset(ds, list(tr_idxs))
     va_set = Subset(ds, list(va_idxs))
-    loader_tr = DataLoader(tr_set, batch_size=args.batch_size, shuffle=True,  num_workers=2)
-    loader_va = DataLoader(va_set, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    k = loader_fast_kwargs(args.num_workers)
+    loader_tr = DataLoader(tr_set, batch_size=args.batch_size, shuffle=True, drop_last=True, **k)
+    loader_va = DataLoader(va_set, batch_size=args.batch_size, shuffle=False, **k)
 
     feat2d = tuple(int(x) for x in args.feat2d.split(",")) if args.feat2d else (32,64,128,256)
     model = UNet2D(in_ch=1, out_ch=1, feat=feat2d).to(DEVICE)
-    opt   = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     bce   = nn.BCEWithLogitsLoss(); dice = DiceLoss()
-    scaler = torch.amp.GradScaler(enabled=(args.amp and DEVICE=="cuda"))
+
+    # AMP + Scheduler + Best checkpoint
+    use_amp = bool(args.amp) and DEVICE == "cuda"
+    scaler = make_scaler(use_amp)
+    sched = torch.optim.lr_scheduler.LambdaLR(optimizer, cosine_with_warmup_lambda(args.epochs, warm=5, min_ratio=0.1))
+    best_dice, best_path = -1.0, None
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        for batch in loader_tr:
+        optimizer.zero_grad(set_to_none=True)
+        train_loss = 0.0; nseen = 0
+        for step, batch in enumerate(loader_tr, 1):
             x = batch["image"].to(DEVICE)
             y = (batch["mask"] > 0).float().to(DEVICE)
-            opt.zero_grad()
-            with torch.amp.autocast(device_type="cuda", enabled=(args.amp and DEVICE=="cuda")):
+            with autocast_ctx(use_amp):
                 lg = model(x)
-                loss = 0.5 * bce(lg, y) + 0.5 * dice(lg, y)
-            scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+                loss = (0.5 * bce(lg, y) + 0.5 * dice(lg, y)) / max(1, args.accum)
+            scaler.scale(loss).backward()
+            if step % args.accum == 0:
+                scaler.unscale_(optimizer)
+                if args.grad_clip and args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer); scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+            train_loss += loss.item() * x.size(0); nseen += x.size(0)
 
         # validation
         model.eval(); dice_v = 0.0; iou_v = 0.0; m = 0
-        with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=(args.amp and DEVICE=="cuda")):
+        with torch.no_grad(), autocast_ctx(use_amp):
             for batch in loader_va:
                 x = batch["image"].to(DEVICE)
                 y = (batch["mask"] > 0).float().to(DEVICE)
@@ -297,60 +349,90 @@ def run_fold_seg_2d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
                     dice_v += d; iou_v += j; m += 1
         dice_v /= max(m, 1); iou_v /= max(m, 1)
 
+        # save best
+        if dice_v > best_dice:
+            best_dice = dice_v
+            best_path = logdir / f"seg_camus_fold{fold_idx}_best.pt"
+            torch.save(model.state_dict(), best_path)
+
+        sched.step()
         if epoch % max(1, args.epochs // 5) == 0 or epoch == args.epochs:
-            print(f"[Fold {fold_idx}] Epoch {epoch}/{args.epochs} | dice={dice_v:.4f} iou={iou_v:.4f}")
+            print(f"[Fold {fold_idx}] Epoch {epoch:03d}/{args.epochs} | "
+                  f"train_loss={(train_loss/max(1,nseen)):.4f} | dice={dice_v:.4f} iou={iou_v:.4f} | "
+                  f"lr {optimizer.param_groups[0]['lr']:.6f}")
+            if best_path is not None:
+                print(f"  ↳ best so far: {best_dice:.4f} @ {best_path.name}")
             track_metric("val", {"dice": dice_v, "iou": iou_v, "epoch": epoch}, args)
+
+    # Use best checkpoint for the preview overlay if we have it
+    if best_path is not None:
+        state = torch.load(best_path, map_location=DEVICE)
+        model.load_state_dict(state)
 
     # Save one overlay
     batch = next(iter(loader_va))
     x = batch["image"].to(DEVICE)
     y = (batch["mask"] > 0).float().to(DEVICE)
-    pr = (torch.sigmoid(model(x)) >= 0.5).float()
+    with torch.no_grad(), autocast_ctx(use_amp):
+        pr = (torch.sigmoid(model(x)) >= 0.5).float()
     out_png = logdir / f"seg_camus_fold{fold_idx}_example.png"
     save_overlay_2d(x[0].cpu(), y[0].cpu(), pr[0].cpu(), out_png)
 
-    return float(dice_v), float(iou_v), str(out_png), None
+    return float(dice_v), float(iou_v), str(out_png), None, (str(best_path) if best_path is not None else "")
 
 
 def run_fold_seg_3d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
     base = ACDC3DEDS(args.meta, split="", phase=phase, aug=None)
     tr_set = Subset(base, list(tr_idxs))
     va_set = Subset(base, list(va_idxs))
-    loader_tr = DataLoader(tr_set, batch_size=args.batch_size, shuffle=True,  num_workers=2)
-    loader_va = DataLoader(va_set, batch_size=1,              shuffle=False, num_workers=2)
+    k = loader_fast_kwargs(args.num_workers)
+    loader_tr = DataLoader(tr_set, batch_size=args.batch_size, shuffle=True, drop_last=True, **k)
+    loader_va = DataLoader(va_set, batch_size=1, shuffle=False, **k)
 
     feat3d = tuple(int(x) for x in args.feat3d.split(",")) if args.feat3d else (16,32,64,128)
     out_ch = 3 if args.acdc_multiclass else 1
     model  = UNet3D(in_ch=1, out_ch=out_ch, feat=feat3d).to(DEVICE)
-    opt    = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     ce     = nn.CrossEntropyLoss()
     bce    = nn.BCEWithLogitsLoss(); dice = DiceLoss()
-    scaler = torch.amp.GradScaler(enabled=(args.amp and DEVICE=="cuda"))
+
+    use_amp = bool(args.amp) and DEVICE == "cuda"
+    scaler = make_scaler(use_amp)
+    sched = torch.optim.lr_scheduler.LambdaLR(optimizer, cosine_with_warmup_lambda(args.epochs, warm=5, min_ratio=0.1))
+    best_dice, best_path = -1.0, None
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        for batch in loader_tr:
+        optimizer.zero_grad(set_to_none=True)
+        train_loss = 0.0; nseen = 0
+        for step, batch in enumerate(loader_tr, 1):
             x   = batch["image"].to(DEVICE)
             msk = batch["mask"].to(DEVICE)
-            opt.zero_grad()
-            with torch.amp.autocast(device_type="cuda", enabled=(args.amp and DEVICE=="cuda")):
+            with autocast_ctx(use_amp):
                 lg = model(x)
                 if args.acdc_multiclass:
-                    y_idx = msk.long().clamp(min=0, max=3)
-                    y_idx = torch.where(y_idx==3, torch.tensor(2, device=y_idx.device),
-                            torch.where(y_idx==2, torch.tensor(1, device=y_idx.device),
-                            torch.where(y_idx==1, torch.tensor(0, device=y_idx.device), torch.tensor(0, device=y_idx.device))))
-                    loss = ce(lg, y_idx)
+                    # map labels {1,2,3} -> {0,1,2}
+                    y_idx = torch.where(msk==3, torch.tensor(2, device=msk.device),
+                            torch.where(msk==2, torch.tensor(1, device=msk.device),
+                            torch.where(msk==1, torch.tensor(0, device=msk.device), torch.tensor(0, device=msk.device)))).long()
+                    loss = ce(lg, y_idx) / max(1, args.accum)
                 else:
                     y = (msk > 0).float()
-                    loss = 0.5 * bce(lg, y) + 0.5 * dice(lg, y)
-            scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+                    loss = (0.5 * bce(lg, y) + 0.5 * dice(lg, y)) / max(1, args.accum)
+            scaler.scale(loss).backward()
+            if step % args.accum == 0:
+                scaler.unscale_(optimizer)
+                if args.grad_clip and args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer); scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+            train_loss += loss.item() * x.size(0); nseen += x.size(0)
 
         # validation
         model.eval(); m = 0
         dice_v = 0.0; iou_v = 0.0
         dice_classes = None; iou_classes = None
-        with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=(args.amp and DEVICE=="cuda")):
+        with torch.no_grad(), autocast_ctx(use_amp):
             for batch in loader_va:
                 x   = batch["image"].to(DEVICE)
                 msk = batch["mask"].to(DEVICE)
@@ -383,26 +465,48 @@ def run_fold_seg_3d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
         else:
             dice_v /= max(m, 1); iou_v /= max(m, 1)
 
+        # save best
+        if dice_v > best_dice:
+            best_dice = dice_v
+            best_path = logdir / f"seg_acdc_fold{fold_idx}_best.pt"
+            torch.save(model.state_dict(), best_path)
+
+        sched.step()
         if epoch % max(1, args.epochs // 5) == 0 or epoch == args.epochs:
-            print(f"[Fold {fold_idx}] Epoch {epoch}/{args.epochs} | dice={dice_v:.4f} iou={iou_v:.4f}")
+            extra = ""
+            if args.acdc_multiclass and m > 0:
+                drv, dmyo, dlv = [float(x) for x in dice_classes.tolist()]
+                irv, imy, ilv = [float(x) for x in iou_classes.tolist()]
+                extra = f" | RV Dice/IoU {drv:.3f}/{irv:.3f} MYO {dmyo:.3f}/{imy:.3f} LV {dlv:.3f}/{ilv:.3f}"
+            print(f"[Fold {fold_idx}] Epoch {epoch:03d}/{args.epochs} | "
+                  f"train_loss={(train_loss/max(1,nseen)):.4f} | dice={dice_v:.4f} iou={iou_v:.4f}{extra} | "
+                  f"lr {optimizer.param_groups[0]['lr']:.6f}")
+            if best_path is not None:
+                print(f"  ↳ best so far: {best_dice:.4f} @ {best_path.name}")
             track_metric("val", {"dice": dice_v, "iou": iou_v, "epoch": epoch}, args)
+
+    # Use best checkpoint for the preview NIfTI if we have it
+    if best_path is not None:
+        state = torch.load(best_path, map_location=DEVICE)
+        model.load_state_dict(state)
 
     # Save a predicted NIfTI for the first val sample (aligned to reference)
     out_pred = logdir / f"seg_acdc_fold{fold_idx}_example_pred.nii.gz"
     va_first = next(iter(loader_va))
     x = va_first["image"].to(DEVICE)
-    lg = model(x)
-    if args.acdc_multiclass:
-        pred = torch.argmax(lg, dim=1, keepdim=True).cpu().numpy()[0,0]
-    else:
-        pred = (torch.sigmoid(lg) >= 0.5).float().cpu().numpy()[0,0]
+    with torch.no_grad(), autocast_ctx(use_amp):
+        lg = model(x)
+        if args.acdc_multiclass:
+            pred = torch.argmax(lg, dim=1, keepdim=True).cpu().numpy()[0,0]
+        else:
+            pred = (torch.sigmoid(lg) >= 0.5).float().cpu().numpy()[0,0]
     ref_path = json.loads(base.df.iloc[int(va_idxs[0])]["paths"])[f"nii_image_{phase}"]
     save_nifti_pred(pred, ref_path, out_pred)
 
     # return per-class vectors so caller can log them
     dpc = dice_classes.cpu().numpy().tolist() if (args.acdc_multiclass and dice_classes is not None) else None
     ipc = iou_classes.cpu().numpy().tolist()  if (args.acdc_multiclass and iou_classes  is not None) else None
-    return float(dice_v), float(iou_v), str(out_pred), (dpc, ipc)
+    return float(dice_v), float(iou_v), str(out_pred), (dpc, ipc), (str(best_path) if best_path is not None else "")
 
 
 # ---------------- Main ----------------
@@ -423,7 +527,10 @@ def main():
     ap.add_argument("--logdir", default="logs")
     ap.add_argument("--feat2d", type=_comma_list, default="", help="e.g. '16,32,64,128' (CAMUS)")
     ap.add_argument("--feat3d", type=_comma_list, default="", help="e.g. '16,32,64,128' (ACDC)")
-    ap.add_argument("--amp", action="store_true", help="Enable mixed precision (autocast + GradScaler)")
+    ap.add_argument("--amp", action="store_true", help="Enable mixed precision")
+    ap.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clip-norm; set 0 to disable")
+    ap.add_argument("--accum", type=int, default=1, help="Gradient accumulation steps")
+    ap.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
     # tracking
     ap.add_argument("--mlflow", action="store_true")
     ap.add_argument("--mlflow-uri", default="", dest="mlflow_uri")
@@ -433,9 +540,13 @@ def main():
     ap.add_argument("--wandb-entity", default="", dest="wandb_entity")
     args = ap.parse_args()
 
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+    # Reproducibility + perf niceties
+    set_all_seeds(args.seed)
+    torch.backends.cudnn.benchmark = True
+    try:
+        torch.set_float32_matmul_precision("high")  # TF32 on Ada/Ampere
+    except Exception:
+        pass
 
     logdir = Path(args.logdir); logdir.mkdir(parents=True, exist_ok=True)
 
@@ -490,14 +601,16 @@ def main():
         va_idxs = np.array(idxs)[va]
 
         if args.dataset == "camus":
-            dice_v, iou_v, artifact, _ = run_fold_seg_2d(tr_idxs, va_idxs, args.phase, logdir, args, fold)
+            dice_v, iou_v, artifact, _, best_ckpt = run_fold_seg_2d(tr_idxs, va_idxs, args.phase, logdir, args, fold)
             dpc = ipc = None
         else:
-            dice_v, iou_v, artifact, tpl = run_fold_seg_3d(tr_idxs, va_idxs, args.phase, logdir, args, fold)
+            dice_v, iou_v, artifact, tpl, best_ckpt = run_fold_seg_3d(tr_idxs, va_idxs, args.phase, logdir, args, fold)
             dpc, ipc = tpl if tpl is not None else (None, None)
 
         print(f"[Fold {fold}] Dice={dice_v:.4f} IoU={iou_v:.4f}")
         row = {"fold": fold, "Dice": dice_v, "IoU": iou_v, "artifact": artifact}
+        if best_ckpt:
+            row["best_ckpt"] = best_ckpt
         if args.dataset == "acdc" and args.acdc_multiclass and dpc is not None and ipc is not None:
             # order: [RV, MYO, LV]
             row.update({
@@ -519,7 +632,8 @@ def main():
         "IoU_mean":  float(np.mean(j)) if j.size>0 else float('nan'),
         "IoU_std":   float(np.std(j))  if j.size>0 else float('nan'),
         "folds": len(metrics), "dataset": args.dataset, "phase": args.phase, "view": args.view,
-        "feat2d": args.feat2d, "feat3d": args.feat3d, "amp": args.amp
+        "feat2d": args.feat2d, "feat3d": args.feat3d, "amp": args.amp,
+        "grad_clip": args.grad_clip, "accum": args.accum, "num_workers": args.num_workers
     }
     if args.dataset == "acdc" and args.acdc_multiclass:
         pdf = pd.DataFrame(metrics)

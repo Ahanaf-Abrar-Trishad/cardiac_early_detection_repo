@@ -4,6 +4,8 @@ cardio_data/processed/
 
 # === Experiments & Artifacts ===
 logs/
+logs_camus/
+logs_acdc/
 logs_ef/
 logs_vol/
 reports/

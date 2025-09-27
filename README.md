@@ -81,21 +81,39 @@ python scripts/make_splits.py --meta meta/master_metadata.csv --seed 42
 
 ### CAMUS — 2D U-Net
 ```bash
-# 4CH, ED phase, 5-fold CV
+# 4CH, ED phase, 5-fold CV, 30 epochs (optimized)
 export PYTHONPATH=$(pwd)
-python scripts/seg_cv.py --dataset camus --view 4CH --phase ED   --folds 5 --epochs 30 --batch-size 8 --lr 1e-3 --logdir logs   --amp --feat2d 32,64,128,256
+python scripts/seg_cv.py --dataset camus --view 4CH --phase ED --folds 5 \
+  --epochs 30 --batch-size 8 --lr 1e-3 --logdir logs_camus \
+  --amp --feat2d 32,64,128,256 \
+  --grad-clip 1.0 --accum 1 --num-workers 4
 ```
 
 ### ACDC — 3D U-Net
 ```bash
-# Multiclass RV/MYO/LV, ED phase
+# Multiclass RV/MYO/LV, ED phase, 60 epochs (optimized)
 export PYTHONPATH=$(pwd)
-python scripts/seg_cv.py --dataset acdc --phase ED   --folds 5 --epochs 60 --batch-size 1 --lr 1e-3 --logdir logs   --acdc-multiclass --amp --feat3d 16,32,64,128
+python scripts/seg_cv.py --dataset acdc --phase ED --folds 5 \
+  --epochs 60 --batch-size 1 --lr 1e-3 --logdir logs_acdc \
+  --acdc-multiclass --amp --feat3d 16,32,64,128 \
+  --grad-clip 1.0 --accum 2 --num-workers 4
+
+# Optional: Add experiment tracking
+# --mlflow --mlflow-experiment seg-cv
+# --wandb --wandb-project cardiac-seg
+
+### Key Optimizations
+
+- **Gradient clipping** (`--grad-clip 1.0`): Prevents gradient explosion during training
+- **Gradient accumulation** (`--accum 1-2`): Simulates larger batch sizes on limited GPU memory
+- **Multi-worker loading** (`--num-workers 4`): Accelerates data loading
+- **Separate log directories**: `logs_camus/` and `logs_acdc/` for organized outputs
+- **Epoch tuning**: 30 epochs for CAMUS (2D), 60 epochs for ACDC (3D) based on convergence
 ```
 
 **Outputs**
-- `logs/cv_seg_<dataset>_metrics.csv` (per-fold Dice/IoU), `cv_seg_<dataset>_summary.json`
-- Example overlays (`*.png`) for CAMUS and example NIfTI preds (`*.nii.gz`) for ACDC
+- `logs_camus/` or `logs_acdc/`: Cross-validation metrics (`cv_seg_<dataset>_metrics.csv`, `cv_seg_<dataset>_summary.json`)
+- Example overlays (`*.png`) for CAMUS and example NIfTI predictions (`*.nii.gz`) for ACDC
 - Optional MLflow/W&B artifacts if `--mlflow/--wandb` are used
 
 ---
@@ -242,11 +260,11 @@ acdc:   ## Process ACDC
 splits: ## Create patient-level splits
 	python scripts/make_splits.py --meta meta/master_metadata.csv --seed 42
 
-seg2d:  ## CAMUS 2D U-Net CV
-	export PYTHONPATH=$(PWD); python scripts/seg_cv.py --dataset camus --view 4CH --phase ED --folds 5 --epochs 30 --batch-size 8 --lr 1e-3 --logdir logs --amp --feat2d 32,64,128,256
+seg2d:  ## CAMUS 2D U-Net CV (30 epochs, optimized)
+	export PYTHONPATH=$(PWD); python scripts/seg_cv.py --dataset camus --view 4CH --phase ED --folds 5 --epochs 30 --batch-size 8 --lr 1e-3 --logdir logs_camus --amp --feat2d 32,64,128,256 --grad-clip 1.0 --accum 1 --num-workers 4
 
-seg3d:  ## ACDC 3D U-Net CV (multiclass)
-	export PYTHONPATH=$(PWD); python scripts/seg_cv.py --dataset acdc --phase ED --folds 5 --epochs 30 --batch-size 1 --lr 1e-3 --logdir logs --acdc-multiclass --amp --feat3d 16,32,64,128
+seg3d:  ## ACDC 3D U-Net CV (60 epochs, optimized)
+	export PYTHONPATH=$(PWD); python scripts/seg_cv.py --dataset acdc --phase ED --folds 5 --epochs 60 --batch-size 1 --lr 1e-3 --logdir logs_acdc --acdc-multiclass --amp --feat3d 16,32,64,128 --grad-clip 1.0 --accum 2 --num-workers 4
 
 cls:    ## ACDC classification (all features)
 	python scripts/classify_cv.py --features meta/acdc_features.csv --folds 5 --seed 42 --logdir logs --mlflow --mlflow-experiment cls-cv
