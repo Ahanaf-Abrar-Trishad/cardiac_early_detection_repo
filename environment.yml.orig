@@ -1,0 +1,21 @@
+name: cardio-dl
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - git
+  - cmake
+  - ninja
+  - pkg-config
+  - ffmpeg
+  - libjpeg-turbo
+  - libpng
+  - libtiff
+  - libopenblas
+  - pip:
+      - -r requirements.txt
+# After creating the env, install PyTorch with the CUDA wheel:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# For CPU-only (no GPU):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu

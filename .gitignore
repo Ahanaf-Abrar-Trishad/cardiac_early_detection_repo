@@ -1,0 +1,39 @@
+# === Data (DO NOT COMMIT DATASETS) ===
+cardio_data/raw/
+cardio_data/processed/
+
+# === Experiments & Artifacts ===
+logs/
+logs_ef/
+logs_vol/
+reports/
+reports_seg/
+mlruns/
+wandb/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.tar
+*.zip
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# === Notebooks ===
+.ipynb_checkpoints/
+
+# === Environments & IDE ===
+.venv/
+env/
+.conda/
+.vscode/
+.idea/
+
+# === OS cruft ===
+.DS_Store
+Thumbs.db

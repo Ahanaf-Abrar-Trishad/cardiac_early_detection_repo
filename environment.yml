@@ -1,0 +1,19 @@
+name: cardio-dl
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - git
+  - cmake
+  - ninja
+  - pkg-config
+  - ffmpeg
+  - libjpeg-turbo
+  - libpng
+  - libtiff
+  - libopenblas
+  - xgboost
+  - pip:
+      - -r requirements.txt
+# For CPU-only (no GPU):
