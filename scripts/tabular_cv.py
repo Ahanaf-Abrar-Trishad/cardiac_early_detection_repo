@@ -12,7 +12,7 @@ from imblearn.pipeline import Pipeline as ImbPipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV
-from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
+from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, roc_curve, confusion_matrix
 from pathlib import Path
 import matplotlib
 matplotlib.use('Agg')
@@ -74,23 +74,36 @@ def main():
     for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y), start=1):
         Xtr, Xva = X.iloc[tr_idx], X.iloc[va_idx]
         ytr, yva = y[tr_idx], y[va_idx]
+        # Determine if binary or multiclass
+        n_classes = len(np.unique(ytr))
+        scoring = "roc_auc" if n_classes == 2 else "roc_auc_ovr"
+        
         search = RandomizedSearchCV(
             estimator=pipe, param_distributions=search_space, n_iter=args.n_iter,
-            scoring="roc_auc", n_jobs=-1, cv=3, refit=True, random_state=args.seed
+            scoring=scoring, n_jobs=-1, cv=3, refit=True, random_state=args.seed
         )
         search.fit(Xtr, ytr)
         best = search.best_estimator_
-        proba = best.predict_proba(Xva)[:,1] if hasattr(best, "predict_proba") else None
         pred = best.predict(Xva)
-        auc = roc_auc_score(yva, proba) if proba is not None else np.nan
+        
+        # Handle AUC calculation for binary vs multiclass
+        if hasattr(best, "predict_proba"):
+            proba = best.predict_proba(Xva)
+            n_classes = len(np.unique(yva))
+            if n_classes == 2:
+                auc = roc_auc_score(yva, proba[:, 1])
+            else:
+                auc = roc_auc_score(yva, proba, multi_class='ovr', average='macro')
+        else:
+            auc = np.nan
         acc = accuracy_score(yva, pred)
-        f1 = f1_score(yva, pred)
+        n_classes = len(np.unique(yva))
+        f1 = f1_score(yva, pred, average='macro' if n_classes > 2 else 'binary')
         metrics.append({"fold": fold, "AUC": float(auc) if proba is not None else float('nan'),
                         "ACC": float(acc), "F1": float(f1)})
         params_per_fold.append({"fold": fold, **search.best_params_})
         print(f"[Fold {fold}] AUC={auc:.4f} ACC={acc:.4f} F1={f1:.4f} | best={search.best_params_}")
 
-    import numpy as np
     m = np.array([[d["AUC"], d["ACC"], d["F1"]] for d in metrics], dtype=float)
     m_auc = float(np.nanmean(m[:,0])); s_auc = float(np.nanstd(m[:,0]))
     m_acc = float(np.mean(m[:,1]));    s_acc = float(np.std(m[:,1]))
@@ -114,12 +127,11 @@ if __name__ == "__main__":
     main()
 
 
-from sklearn.metrics import roc_curve, confusion_matrix
+
 def save_roc_and_cm(y, probs, preds, out_prefix: Path):
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
     # ROC
     try:
-        import numpy as np, json
         if probs is not None and len(np.unique(y))>1:
             fpr, tpr, thr = roc_curve(y, probs)
             plt.figure(); plt.plot(fpr, tpr); plt.plot([0,1],[0,1],'--'); plt.xlabel('FPR'); plt.ylabel('TPR'); plt.title('ROC')
@@ -131,5 +143,10 @@ def save_roc_and_cm(y, probs, preds, out_prefix: Path):
     try:
         cm = confusion_matrix(y, preds, labels=[0,1])
         plt.figure(); plt.imshow(cm, interpolation='nearest'); plt.title('Confusion Matrix'); plt.xlabel('Pred'); plt.ylabel('True')
-        for i in range(cm.shape[0]):\n            for j in range(cm.shape[1]):\n                plt.text(j, i, str(cm[i,j]), ha='center', va='center')\n        plt.colorbar(); plt.savefig(out_prefix.with_suffix('.cm.png')); plt.close()
-        import json\n        with open(out_prefix.with_suffix('.cm.json'),'w') as f: json.dump({'labels':[0,1], 'matrix': cm.tolist()}, f, indent=2)\n    except Exception as e:\n        print('CM save failed:', e)\n
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                plt.text(j, i, str(cm[i,j]), ha='center', va='center')
+        plt.colorbar(); plt.savefig(out_prefix.with_suffix('.cm.png')); plt.close()
+        with open(out_prefix.with_suffix('.cm.json'),'w') as f: json.dump({'labels':[0,1], 'matrix': cm.tolist()}, f, indent=2)
+    except Exception as e:
+        print('CM save failed:', e)

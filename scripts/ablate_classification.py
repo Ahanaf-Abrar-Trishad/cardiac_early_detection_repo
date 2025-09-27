@@ -78,11 +78,10 @@ def run_cv(ds, labels="three", sampler="weighted", seed=42):
                 x,yb = x.to(DEVICE), torch.tensor(yb).to(DEVICE)
                 opt.zero_grad(); lg=model(x); loss=crit(lg,yb); loss.backward(); opt.step()
         # eval
-        import numpy as np
         model.eval(); all_logits=[]; all_y=[]
         for x,yb in val_loader:
             x=x.to(DEVICE); lg=model(x); all_logits.append(lg.cpu()); all_y.extend(yb)
-        lg=torch.cat(all_logits,0); pr = torch.softmax(lg,1).numpy(); yva=np.array(all_y)
+        lg=torch.cat(all_logits,0); pr = torch.softmax(lg,1).detach().numpy(); yva=np.array(all_y)
         yhat = pr.argmax(1)
         if num_classes==2:
             auc = roc_auc_score(yva, pr[:,1]) if len(np.unique(yva))>1 else np.nan

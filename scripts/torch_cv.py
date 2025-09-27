@@ -247,10 +247,6 @@ def main():
         "folds": len(results), "view": args.view, "phase": args.phase, "trials": args.trials, "seed": args.seed, "labels": args.labels
     }, f, indent=2)
 
-if __name__ == "__main__":
-    main()
-
-
 def save_pr_curves(y, probs, out_prefix, num_classes):
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -270,3 +266,6 @@ def save_pr_curves(y, probs, out_prefix, num_classes):
                 with open(out_prefix.with_suffix(f'.class{k}.pr.json'),'w') as f: json.dump({'precision':p.tolist(),'recall':r.tolist(),'thr':thr.tolist()}, f, indent=2)
     except Exception as e:
         print("PR save failed:", e)
+
+if __name__ == "__main__":
+    main()

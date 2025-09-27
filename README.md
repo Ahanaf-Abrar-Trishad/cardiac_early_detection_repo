@@ -156,17 +156,33 @@ Two ready-to-run notebooks live in `notebooks/`:
 The `scripts/` directory includes several additional tools for advanced analysis:
 
 - **`ablate_classification.py`** — Ablation study for CAMUS image classification (augmentation, ImageNet init, sampling strategies)
+- **`extract_acdc_ef.py`** — Extract ACDC EF values from segmentation masks (calculates EF from LV volumes at ED/ES frames)
 - **`make_results_summary.py`** — Aggregates all logs into a comprehensive `RESULTS.md` markdown report
 - **`qc_report.py`** — Quick quality control: EF histograms and data distribution summaries
 - **`tabular_cv.py`** — Alternative tabular classification pipeline with anti-leakage safeguards
 - **`torch_cv.py`** — Deep learning classification CV for CAMUS with Optuna hyperparameter optimization
 
 ```bash
-# Example: Run ablation study for CAMUS classification
-python scripts/ablate_classification.py --meta meta/master_metadata.csv --labels three --view 4CH --phase ED --out logs/ablation_cls.csv
+# Extract CAMUS EF labels (run first if CAMUS data lacks EF values)
+python scripts/extract_camus_ef.py
+
+# Extract ACDC EF values from segmentation masks
+python scripts/extract_acdc_ef.py --meta meta/master_metadata.csv --data_root cardio_data/raw/acdc
 
 # Generate comprehensive results summary
 python scripts/make_results_summary.py
+
+# Run quality control check on metadata
+python scripts/qc_report.py --meta meta/master_metadata.csv
+
+# Run CAMUS classification ablation study
+python scripts/ablate_classification.py --logdir logs_ablation --cv_folds 3 --trials 2
+
+# Tabular classification with anti-leakage pipeline
+python scripts/tabular_cv.py --meta meta/master_metadata.csv --features cardio_data/processed/acdc_features.csv --target "EF_binary" --folds 3
+
+# Deep learning classification with hyperparameter optimization
+python scripts/torch_cv.py --meta meta/master_metadata.csv --labels three --view 4CH --phase ED --folds 2 --trials 2 --logdir logs
 ```
 
 ---
