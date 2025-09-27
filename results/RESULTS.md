@@ -16,3 +16,8 @@
 - Dice (MYO): 0.496 ± 0.052
 - Dice (LV): 0.651 ± 0.080
 
+
+# Ablation (Classification)
+
+
+See `logs/ablation_cls.csv` for full table.

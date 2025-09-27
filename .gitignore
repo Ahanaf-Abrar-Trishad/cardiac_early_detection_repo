@@ -6,6 +6,8 @@ cardio_data/processed/
 logs/
 logs_camus/
 logs_acdc/
+logs_tabular/
+logs_torch/
 logs_ef/
 logs_vol/
 reports/

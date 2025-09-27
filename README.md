@@ -201,7 +201,7 @@ python scripts/qc_report.py --meta meta/master_metadata.csv
 python scripts/ablate_classification.py --meta meta/master_metadata.csv --labels three --view 4CH --phase ED --out logs/ablation_cls.csv
 
 # Tabular classification with anti-leakage pipeline
-python scripts/tabular_cv.py --meta meta/master_metadata.csv --features meta/acdc_features.csv --target EF_binary --folds 3
+python scripts/tabular_cv.py --csv meta/acdc_features.csv --target label --folds 3 --logdir logs_tabular --categoricals patient_id
 
 # Deep learning classification with hyperparameter optimization
 python scripts/torch_cv.py --meta meta/master_metadata.csv --labels three --view 4CH --phase ED --folds 2 --trials 2 --logdir logs

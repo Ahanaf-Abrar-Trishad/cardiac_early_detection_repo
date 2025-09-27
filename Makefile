@@ -78,7 +78,7 @@ ablation: ## CAMUS classification ablation study
 	$(PYTHON) scripts/ablate_classification.py --meta $(META) --labels three --view 4CH --phase ED --out logs/ablation_cls.csv
 tabular-cv: ## Tabular classification with anti-leakage pipeline
 	export PYTHONPATH=$(PYTHONPATH); \
-	$(PYTHON) scripts/tabular_cv.py --meta $(META) --features meta/acdc_features.csv --target EF_binary --folds 3
+	$(PYTHON) scripts/tabular_cv.py --csv meta/acdc_features.csv --target label --folds 3 --logdir logs_tabular --categoricals patient_id
 torch-cv: ## Deep learning classification with Optuna optimization
 	export PYTHONPATH=$(PYTHONPATH); \
 	$(PYTHON) scripts/torch_cv.py --meta $(META) --labels three --view 4CH --phase ED --folds 2 --trials 2 --logdir logs_torch
