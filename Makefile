@@ -45,7 +45,7 @@ seg2d: ## CAMUS 2D U-Net CV (4CH/ED, AMP)
 seg3d: ## ACDC 3D U-Net CV (ED, multiclass RV/MYO/LV, AMP)
 	export PYTHONPATH=$(PYTHONPATH); \
 	$(PYTHON) scripts/seg_cv.py --dataset acdc --phase ED \
-	  --folds 5 --epochs 30 --batch-size 1 --lr 1e-3 --logdir $(LOGDIR) \
+	  --folds 5 --epochs 60 --batch-size 1 --lr 1e-3 --logdir $(LOGDIR) \
 	  --acdc-multiclass --amp --feat3d 16,32,64,128
 
 # ===== Feature extraction =====
