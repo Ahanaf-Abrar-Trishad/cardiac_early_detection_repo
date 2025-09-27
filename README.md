@@ -101,6 +101,12 @@ python scripts/seg_cv.py --dataset acdc --phase ED --folds 5 \
 # Optional: Add experiment tracking
 # --mlflow --mlflow-experiment seg-cv
 # --wandb --wandb-project cardiac-seg
+```
+> Or use `make` shortcuts if present:
+> ```bash
+> make seg2d
+> make seg3d
+> ```
 
 ### Key Optimizations
 
@@ -109,7 +115,7 @@ python scripts/seg_cv.py --dataset acdc --phase ED --folds 5 \
 - **Multi-worker loading** (`--num-workers 4`): Accelerates data loading
 - **Separate log directories**: `logs_camus/` and `logs_acdc/` for organized outputs
 - **Epoch tuning**: 30 epochs for CAMUS (2D), 60 epochs for ACDC (3D) based on convergence
-```
+
 
 **Outputs**
 - `logs_camus/` or `logs_acdc/`: Cross-validation metrics (`cv_seg_<dataset>_metrics.csv`, `cv_seg_<dataset>_summary.json`)
@@ -253,34 +259,6 @@ make seg3d      # ACDC 3D U-Net CV (ED, multiclass RV/MYO/LV, AMP)
 
 # Clinical classification CV
 make cls        # ACDC classification (all features); you may also have cls-ef, cls-vol
-```
-
-> If `make seg2d`, `make seg3d`, or `make cls` aren’t present yet, you can add them by mapping
-> to the exact Python commands used above. A common pattern is:
-
-```makefile
-# Example help target to auto-generate usage
-help:  ## Show help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  [36m%-18s[0m %s
-", $$1, $$2}'
-
-camus:  ## Process CAMUS
-	python scripts/camus_process.py --raw cardio_data/raw/camus --out cardio_data/processed/camus --size 256
-
-acdc:   ## Process ACDC
-	python scripts/acdc_process.py --raw cardio_data/raw/acdc --out cardio_data/processed/acdc --target_spacing 1.25 1.25 10.0
-
-splits: ## Create patient-level splits
-	python scripts/make_splits.py --meta meta/master_metadata.csv --seed 42
-
-seg2d:  ## CAMUS 2D U-Net CV (30 epochs, optimized)
-	export PYTHONPATH=$(PWD); python scripts/seg_cv.py --dataset camus --view 4CH --phase ED --folds 5 --epochs 30 --batch-size 8 --lr 1e-3 --logdir logs_camus --amp --feat2d 32,64,128,256 --grad-clip 1.0 --accum 1 --num-workers 4
-
-seg3d:  ## ACDC 3D U-Net CV (60 epochs, optimized)
-	export PYTHONPATH=$(PWD); python scripts/seg_cv.py --dataset acdc --phase ED --folds 5 --epochs 60 --batch-size 1 --lr 1e-3 --logdir logs_acdc --acdc-multiclass --amp --feat3d 16,32,64,128 --grad-clip 1.0 --accum 2 --num-workers 4
-
-cls:    ## ACDC classification (all features)
-	python scripts/classify_cv.py --features meta/acdc_features.csv --folds 5 --seed 42 --logdir logs --mlflow --mlflow-experiment cls-cv
 ```
 
 Use `make` wherever possible to keep your workflow reproducible and one-command simple.
