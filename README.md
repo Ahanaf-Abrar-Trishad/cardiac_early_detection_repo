@@ -151,7 +151,27 @@ Two ready-to-run notebooks live in `notebooks/`:
 
 ---
 
-## 8) Reproducibility & leakage prevention
+## 8) Additional utility scripts
+
+The `scripts/` directory includes several additional tools for advanced analysis:
+
+- **`ablate_classification.py`** — Ablation study for CAMUS image classification (augmentation, ImageNet init, sampling strategies)
+- **`make_results_summary.py`** — Aggregates all logs into a comprehensive `RESULTS.md` markdown report
+- **`qc_report.py`** — Quick quality control: EF histograms and data distribution summaries
+- **`tabular_cv.py`** — Alternative tabular classification pipeline with anti-leakage safeguards
+- **`torch_cv.py`** — Deep learning classification CV for CAMUS with Optuna hyperparameter optimization
+
+```bash
+# Example: Run ablation study for CAMUS classification
+python scripts/ablate_classification.py --meta meta/master_metadata.csv --labels three --view 4CH --phase ED --out logs/ablation_cls.csv
+
+# Generate comprehensive results summary
+python scripts/make_results_summary.py
+```
+
+---
+
+## 9) Reproducibility & leakage prevention
 
 - **Patient-level CV**: GroupKFold / StratifiedGroupKFold with groups = patient IDs.
 - **No leakage**: All encoders/scalers/SMOTE/feature selection fit **inside** training folds.
@@ -159,12 +179,14 @@ Two ready-to-run notebooks live in `notebooks/`:
 - **Documented env**: `environment.yml` + `requirements.txt`. Keep PyTorch installed to match your CUDA.
 - **Paths & data**: metadata (`meta/master_metadata.csv`) is updated by processing scripts and split maker.
 
+> **📋 See `REPRODUCIBILITY.md`** for detailed notes on determinism, data sources, and exact reproduction steps.
+
 ---
 
 
 ---
 
-## 9) Makefile quickstart (recommended)
+## 10) Makefile quickstart (recommended)
 
 You already have a **Makefile** — great! Use it to run the common pipelines without remembering long commands.
 
@@ -219,7 +241,7 @@ cls:    ## ACDC classification (all features)
 
 Use `make` wherever possible to keep your workflow reproducible and one-command simple.
 
-## 10) Citations
+## 11) Citations
 
 - **CAMUS**: Leclerc, S. *et al.* “Deep Learning for Segmentation of the Left Ventricle from Echocardiographic Data.” (CAMUS dataset).
 - **ACDC**: Bernard, O. *et al.* “Deep Learning Techniques for Cardiac MR Segmentation: A Short Review.” (ACDC challenge).
@@ -229,4 +251,5 @@ Please follow the datasets’ official citation rules in publications.
 ---
 
 ## License
+
 For academic/research use. Check dataset licenses and terms.
