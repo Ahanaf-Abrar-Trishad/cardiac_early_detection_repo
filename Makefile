@@ -65,6 +65,29 @@ cls-ef: ## EF-only ablation
 cls-vol: ## Volumes-only ablation + calibration
 	$(PYTHON) scripts/classify_cv.py --features meta/acdc_features.csv --subset vol --calibrate --folds 5 --seed 42 --logdir logs_vol
 
+# ===== Utility Scripts =====
+.PHONY: extract-ef-camus extract-ef-acdc ablation tabular-cv torch-cv qc-report results
+extract-ef-camus: ## Extract CAMUS EF from Info.cfg files
+	export PYTHONPATH=$(PYTHONPATH); \
+	$(PYTHON) scripts/extract_camus_ef.py
+extract-ef-acdc: ## Extract ACDC EF from segmentation masks
+	export PYTHONPATH=$(PYTHONPATH); \
+	$(PYTHON) scripts/extract_acdc_ef.py --meta $(META) --data_root $(RAW_ACDC)
+ablation: ## CAMUS classification ablation study
+	export PYTHONPATH=$(PYTHONPATH); \
+	$(PYTHON) scripts/ablate_classification.py --meta $(META) --labels three --view 4CH --phase ED --out logs/ablation_cls.csv
+tabular-cv: ## Tabular classification with anti-leakage pipeline
+	export PYTHONPATH=$(PYTHONPATH); \
+	$(PYTHON) scripts/tabular_cv.py --meta $(META) --features meta/acdc_features.csv --target EF_binary --folds 3
+torch-cv: ## Deep learning classification with Optuna optimization
+	export PYTHONPATH=$(PYTHONPATH); \
+	$(PYTHON) scripts/torch_cv.py --meta $(META) --labels three --view 4CH --phase ED --folds 2 --trials 2 --logdir logs_torch
+qc-report: ## Generate quality control report
+	export PYTHONPATH=$(PYTHONPATH); \
+	$(PYTHON) scripts/qc_report.py --meta $(META)
+results: ## Generate comprehensive results summary
+	$(PYTHON) scripts/make_results_summary.py
+
 # ===== Reports / Notebooks =====
 .PHONY: reports
 reports: ## Run notebooks manually (open in Jupyter) and write to reports/ & reports_seg/

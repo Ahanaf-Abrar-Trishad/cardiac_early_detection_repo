@@ -181,6 +181,10 @@ The `scripts/` directory includes several additional tools for advanced analysis
 - **`torch_cv.py`** — Deep learning classification CV for CAMUS with Optuna hyperparameter optimization
 
 ```bash
+# Always set PYTHONPATH and activate environment first
+export PYTHONPATH=$(pwd)
+conda activate cardio-dl  # or your environment name
+
 # Extract CAMUS EF labels (run first if CAMUS data lacks EF values)
 python scripts/extract_camus_ef.py
 
@@ -193,15 +197,24 @@ python scripts/make_results_summary.py
 # Run quality control check on metadata
 python scripts/qc_report.py --meta meta/master_metadata.csv
 
-# Run CAMUS classification ablation study
-python scripts/ablate_classification.py --logdir logs_ablation --cv_folds 3 --trials 2
+# Run CAMUS classification ablation study (correct arguments)
+python scripts/ablate_classification.py --meta meta/master_metadata.csv --labels three --view 4CH --phase ED --out logs/ablation_cls.csv
 
 # Tabular classification with anti-leakage pipeline
-python scripts/tabular_cv.py --meta meta/master_metadata.csv --features cardio_data/processed/acdc_features.csv --target "EF_binary" --folds 3
+python scripts/tabular_cv.py --meta meta/master_metadata.csv --features meta/acdc_features.csv --target EF_binary --folds 3
 
 # Deep learning classification with hyperparameter optimization
 python scripts/torch_cv.py --meta meta/master_metadata.csv --labels three --view 4CH --phase ED --folds 2 --trials 2 --logdir logs
 ```
+
+> **💡 Tip**: Use the Makefile targets instead for easier execution:
+> ```bash
+> make ablation      # CAMUS ablation study
+> make tabular-cv    # Tabular classification
+> make torch-cv      # Deep learning classification
+> make qc-report     # Quality control report
+> make results       # Results summary
+> ```
 
 ---
 
