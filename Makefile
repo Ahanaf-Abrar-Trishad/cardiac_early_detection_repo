@@ -40,13 +40,13 @@ splits: ## Create patient-level splits and write $(META)
 seg2d: ## CAMUS 2D U-Net CV (4CH/ED, 30 epochs, optimized)
 	export PYTHONPATH=$(PYTHONPATH); \
 	$(PYTHON) scripts/seg_cv.py --dataset camus --view 4CH --phase ED --folds 5 \
-	  --epochs 30 --batch-size 8 --lr 1e-3 --logdir logs_camus \
+	  --epochs 30 --batch-size 8 --lr 1e-3 --logdir $(LOGDIR) \
 	  --amp --feat2d 32,64,128,256 \
 	  --grad-clip 1.0 --accum 1 --num-workers 4
 seg3d: ## ACDC 3D U-Net CV (ED, multiclass, 60 epochs, optimized)
 	export PYTHONPATH=$(PYTHONPATH); \
 	$(PYTHON) scripts/seg_cv.py --dataset acdc --phase ED --folds 5 \
-	  --epochs 60 --batch-size 1 --lr 1e-3 --logdir logs_acdc \
+	  --epochs 60 --batch-size 1 --lr 1e-3 --logdir $(LOGDIR) \
 	  --acdc-multiclass --amp --feat3d 16,32,64,128 \
 	  --grad-clip 1.0 --accum 2 --num-workers 4
 
