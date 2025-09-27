@@ -183,9 +183,6 @@ python scripts/make_results_summary.py
 
 ---
 
-
----
-
 ## 10) Makefile quickstart (recommended)
 
 You already have a **Makefile** — great! Use it to run the common pipelines without remembering long commands.
