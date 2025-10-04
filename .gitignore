@@ -20,6 +20,7 @@ wandb/
 *.onnx
 *.tar
 *.zip
+*.npy
 
 # === Python ===
 __pycache__/
