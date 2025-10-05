@@ -14,6 +14,10 @@ dependencies:
   - libtiff
   - libopenblas
   - xgboost
+  # NOTE: PyTorch is intentionally NOT pinned here.
+  # Install it separately per your CUDA setup, e.g.:
+  #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
   - pip:
       - -r requirements.txt
-# For CPU-only (no GPU):
+      - pre-commit>=3.7
+      - ruff>=0.6

@@ -41,6 +41,8 @@ ipykernel>=6.25
 black>=24.3
 isort>=5.13
 pytest>=7.4
+pre-commit>=3.7
+ruff>=0.6
 
 # NOTE: DO NOT pin torch/torchvision here because we install them separately
-# with the correct CUDA wheels. See setup script or README for the command.
+# with the correct CUDA wheels. See README for the command.
