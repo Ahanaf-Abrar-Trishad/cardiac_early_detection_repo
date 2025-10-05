@@ -2,36 +2,37 @@
 
 Deep-learning + classical ML pipeline for early cardiac condition detection from **echocardiography (CAMUS)** and **cardiac MRI (ACDC)**.
 
-**What’s included**
-- Data processing for CAMUS (2D echo) and ACDC (3D MRI)
-- Patient-level, leakage-safe CV for **segmentation** (2D/3D U-Net)
-- ACDC **feature extraction** (ED/ES volumes, EF, etc.) and **clinical classification** (NOR, DCM, HCM, MINF, RV)
-- MLflow/W&B hooks, rich logs (CSV/JSON), confusion matrices, overlays & NIfTI preds
-- Two report notebooks in `notebooks/`: **classification** and **segmentation** aggregators
+## What’s new (polished pipeline)
+- **ACDC 3D U‑Net multiclass (RV/MYO/LV)** with **class‑weighted CE** (`--class-weights auto|w1,w2,w3`) + **multiclass Dice** (`--dice-weight`).
+- **3D augmentations** (random flips, in‑plane rotations, gamma/brightness jitter) with simple flags (`--aug3d ...`).
+- **Per‑epoch per‑class CSV logging** for ACDC (`--perclass-csv results/acdc_per_class_dice.csv`) and validation preview overlays (`--save-val-previews`).
+- **OOF inference** script to generate fold‑wise predictions and indexes.
+- **Robust volume/EF & geometry features** from OOF segmentations + a compact **diagnosis** baseline (NOR/DCM/HCM/MINF/RV).
+- **Makefile** targets for one‑command execution.
 
 ---
 
 ## 1) Environment
 
 ```bash
-# Create / activate environment from your files
+# Create / activate the environment
 conda env create -f environment.yml
 conda activate cardio-dl
 
-# Install the correct PyTorch for your CUDA (examples)
-# CUDA 12.4 wheels:
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# Install PyTorch that matches your CUDA (examples)
+# CUDA 12.1 wheels:
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 # CPU-only:
 # pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
-# Project Python deps (if not installed via environment.yml's pip step)
+# Project deps if not installed via environment.yml
 pip install -r requirements.txt
 ```
-> Tip: A quick-start script is also provided: `setup_cuda_pytorch.sh`.
+> Tip: set `export PYTHONPATH=$(pwd):$PYTHONPATH` before running any repo script.
 
-**Hardware notes** (example stable configs)
-- ACDC 3D: `--batch-size 1` on a 16GB GPU (e.g., RTX 4080 Super) works well.
-- CAMUS 2D: `--batch-size 8` typically fits comfortably on 16GB for 256×256 inputs.
+**Hardware notes**
+- ACDC 3D: `--batch-size 1` on a 16GB GPU is a good default.
+- CAMUS 2D: `--batch-size 8` usually fits on 16GB for 256×256 inputs.
 
 ---
 
@@ -47,231 +48,177 @@ cardio_data/
         patientXXXX_4CH_ED.nii.gz
         ...
     acdc/
-      # Either the official "database/training/patientXXX" layout OR
-      patientXXX/patientXXX_frame01.nii.gz, patientXXX_frame01_gt.nii.gz, ...
+      patientXXX/
+        # ED/ES short-axis volumes (+ ground truths if available)
+        patientXXX_ED.nii.gz
+        patientXXX_ES.nii.gz
+        ...
 ```
 
 ---
 
-## 3) Build processed datasets
+## 3) Build processed datasets + splits
 
 ```bash
 # CAMUS (resized to 256×256; ED/ES pairs and masks)
-python scripts/camus_process.py --raw cardio_data/raw/camus     --out cardio_data/processed/camus --size 256
+python scripts/camus_process.py --raw cardio_data/raw/camus --out cardio_data/processed/camus --size 256
 
 # ACDC (SAX resample to ~1.25×1.25×10.0 mm; ED/ES)
-python scripts/acdc_process.py --raw cardio_data/raw/acdc     --out cardio_data/processed/acdc --target_spacing 1.25 1.25 10.0
-```
+python scripts/acdc_process.py --raw cardio_data/raw/acdc --out cardio_data/processed/acdc --target_spacing 1.25 1.25 10.0
 
-Create **patient-level splits**:
-```bash
+# Create patient-level splits and write meta
 python scripts/make_splits.py --meta meta/master_metadata.csv --seed 42
 ```
-
-> You can also use `make` shortcuts if present:
-> ```bash
-> make camus
-> make acdc
-> make splits
-> ```
 
 ---
 
 ## 4) Segmentation CV (patient-level, no leakage)
 
-### CAMUS — 2D U-Net
+Always export PYTHONPATH:
 ```bash
-# 4CH, ED phase, 5-fold CV, 30 epochs (optimized)
-export PYTHONPATH=$(pwd)
+export PYTHONPATH=$(pwd):$PYTHONPATH
+```
+
+### CAMUS — 2D U‑Net (binary LV)
+```bash
 python scripts/seg_cv.py --dataset camus --view 4CH --phase ED --folds 5 \
-  --epochs 30 --batch-size 8 --lr 1e-3 --logdir logs_camus \
+  --epochs 30 --batch-size 8 --lr 1e-3 --logdir logs \
   --amp --feat2d 32,64,128,256 \
   --grad-clip 1.0 --accum 1 --num-workers 4
 ```
 
-### ACDC — 3D U-Net
+### ACDC — 3D U‑Net (multiclass RV/MYO/LV)
 ```bash
-# Multiclass RV/MYO/LV, ED phase, 60 epochs (optimized)
-export PYTHONPATH=$(pwd)
 python scripts/seg_cv.py --dataset acdc --phase ED --folds 5 \
-  --epochs 60 --batch-size 1 --lr 1e-3 --logdir logs_acdc \
+  --epochs 60 --batch-size 1 --lr 1e-3 --logdir logs \
   --acdc-multiclass --amp --feat3d 16,32,64,128 \
-  --grad-clip 1.0 --accum 2 --num-workers 4
-
-# Optional: Add experiment tracking
-# --mlflow --mlflow-experiment seg-cv
-# --wandb --wandb-project cardiac-seg
+  --grad-clip 1.0 --accum 2 --num-workers 4 \
+  --save-val-previews --preview-batches 3 --perclass-csv results/acdc_per_class_dice.csv \
+  --class-weights auto --ce-weight 1.0 --dice-weight 0.7 \
+  --aug3d --p-flip 0.5 --p-rot 0.5 --rot-deg 12 --p-gamma 0.5 --gamma-min 0.9 --gamma-max 1.15 \
+  --p-bright 0.5 --bright-min 0.9 --bright-max 1.1
 ```
-> Or use `make` shortcuts if present:
-> ```bash
-> make seg2d
-> make seg3d
-> ```
 
-### Key Optimizations
+**Key outputs**
+- `logs/seg_acdc_fold{1..5}_best.pt` — best checkpoints per fold.
+- `logs/cv_seg_acdc_metrics.csv`, `logs/cv_seg_acdc_summary.json` — CV metrics.
+- `results/acdc_per_class_dice.csv` — per‑epoch per‑class Dice/IoU (when multiclass).
+- `logs/runs/acdc_val_previews/.../*.png` — ED/ES preview overlays.
 
-- **Gradient clipping** (`--grad-clip 1.0`): Prevents gradient explosion during training
-- **Gradient accumulation** (`--accum 1-2`): Simulates larger batch sizes on limited GPU memory
-- **Multi-worker loading** (`--num-workers 4`): Accelerates data loading
-- **Separate log directories**: `logs_camus/` and `logs_acdc/` for organized outputs
-- **Epoch tuning**: 30 epochs for CAMUS (2D), 60 epochs for ACDC (3D) based on convergence
+---
 
+## 5) OOF inference (ACDC multiclass)
 
+Run out‑of‑fold inference for both phases to produce NIfTIs + an index CSV for each phase.
+```bash
+# ED
+python scripts/oof_infer_acdc.py --phase ED --folds 5 --amp \
+  --ckpt-pattern logs/seg_acdc_fold{fold}_best.pt \
+  --oof-dir logs/oof_preds/acdc
+
+# ES
+python scripts/oof_infer_acdc.py --phase ES --folds 5 --amp \
+  --ckpt-pattern logs/seg_acdc_fold{fold}_best.pt \
+  --oof-dir logs/oof_preds/acdc
+```
 **Outputs**
-- `logs_camus/` or `logs_acdc/`: Cross-validation metrics (`cv_seg_<dataset>_metrics.csv`, `cv_seg_<dataset>_summary.json`)
-- Example overlays (`*.png`) for CAMUS and example NIfTI predictions (`*.nii.gz`) for ACDC
-- Optional MLflow/W&B artifacts if `--mlflow/--wandb` are used
+- `results/acdc_oof_index_ED.csv`, `results/acdc_oof_index_ES.csv`.
+- NIfTIs: `logs/oof_preds/acdc/ED/*.nii.gz`, `logs/oof_preds/acdc/ES/*.nii.gz`.
 
 ---
 
-## 5) ACDC feature extraction (ED/ES volumes & EF)
+## 6) Build robust volumes/EF & geometry features
+
+From the OOF segmentations we assemble robust LV/RV ED/ES volumes, robust EF estimates, and simple geometry features.
 
 ```bash
-export PYTHONPATH=$(pwd)
-python scripts/extract_features_acdc.py   --meta meta/master_metadata.csv   --raw  cardio_data/raw/acdc   --out  meta/acdc_features.csv
+python scripts/build_features_geom.py
 ```
-This writes `meta/acdc_features.csv` with per-patient LV/RV ED/ES volumes, EF, and label.
+**Outputs (under `results/`)**
+- `acdc_oof_features_robust.csv`  — robust volumes + EF (with NaN counts reported).
+- `acdc_oof_features_geom.csv`    — adds geometric features (myocardial thickness stats, axis ratios, etc.).
 
----
-
-## 6) Clinical classification CV (NOR/DCM/HCM/MINF/RV)
-
-We train **LogReg**, **RandomForest**, **XGBoost** on the tabular features with **StratifiedGroupKFold** (patient-level), **OneHot/Scaling/SMOTE/FS inside folds** (no leakage).
-
-**All features**
+Export labels (if needed):
 ```bash
-python scripts/classify_cv.py --features meta/acdc_features.csv   --folds 5 --seed 42 --logdir logs --mlflow --mlflow-experiment cls-cv
-```
-
-**EF-only**
-```bash
-python scripts/classify_cv.py --features meta/acdc_features.csv   --subset ef --folds 5 --seed 42 --logdir logs_ef
-```
-
-**Volumes-only + probability calibration**
-```bash
-python scripts/classify_cv.py --features meta/acdc_features.csv   --subset vol --calibrate --folds 5 --seed 42 --logdir logs_vol
-```
-
-**Outputs**
-- Per-model per-fold metrics: `logs/cv_cls_<model>_metrics.csv`
-- Aggregates: `logs/cv_cls_summary.csv`
-- Confusion matrices: `logs/cv_cls_<model>_fold*_cm.png`
-- Feature importances / coefficients: `logs/feature_importance/`
-
----
-
-## 7) Reports / notebooks
-
-Two ready-to-run notebooks live in `notebooks/`:
-
-- `cardiac_cls_report.ipynb` — Aggregates **classification** logs from `logs/`, `logs_ef/`, `logs_vol/` and writes plots/tables to `reports/`.
-- `cardiac_seg_report.ipynb` — Aggregates **segmentation** logs (CAMUS & ACDC) and writes plots/tables to `reports_seg/`.
-
-```bash
-# From repo root, open the notebooks and Run All
-# The reports will be saved under reports/ and reports_seg/
+python - << 'PY'
+import pandas as pd, pathlib
+df = pd.read_csv("meta/master_metadata.csv")
+lab = (df[df["dataset"]=="acdc"][["patient_id","diagnosis"]]
+         .drop_duplicates().sort_values("patient_id"))
+pathlib.Path("results").mkdir(parents=True, exist_ok=True)
+lab.to_csv("results/acdc_labels.csv", index=False)
+print("Saved results/acdc_labels.csv")
+PY
 ```
 
 ---
 
-## 8) Additional utility scripts
+## 7) Diagnosis baseline (NOR/DCM/HCM/MINF/RV)
 
-The `scripts/` directory includes several additional tools for advanced analysis:
-
-- **`ablate_classification.py`** — Ablation study for CAMUS image classification (augmentation, ImageNet init, sampling strategies)
-- **`extract_acdc_ef.py`** — Extract ACDC EF values from segmentation masks (calculates EF from LV volumes at ED/ES frames)
-- **`make_results_summary.py`** — Aggregates all logs into a comprehensive `RESULTS.md` markdown report
-- **`qc_report.py`** — Quick quality control: EF histograms and data distribution summaries
-- **`tabular_cv.py`** — Alternative tabular classification pipeline with anti-leakage safeguards
-- **`torch_cv.py`** — Deep learning classification CV for CAMUS with Optuna hyperparameter optimization
-
+Train a compact baseline on the robust+geom features with group‑aware CV.
 ```bash
-# Always set PYTHONPATH and activate environment first
-export PYTHONPATH=$(pwd)
-conda activate cardio-dl  # or your environment name
-
-# Extract CAMUS EF labels (run first if CAMUS data lacks EF values)
-python scripts/extract_camus_ef.py
-
-# Extract ACDC EF values from segmentation masks
-python scripts/extract_acdc_ef.py --meta meta/master_metadata.csv --data_root cardio_data/raw/acdc
-
-# Generate comprehensive results summary
-python scripts/make_results_summary.py
-
-# Run quality control check on metadata
-python scripts/qc_report.py --meta meta/master_metadata.csv
-
-# Run CAMUS classification ablation study (correct arguments)
-python scripts/ablate_classification.py --meta meta/master_metadata.csv --labels three --view 4CH --phase ED --out logs/ablation_cls.csv
-
-# Tabular classification with anti-leakage pipeline
-python scripts/tabular_cv.py --csv meta/acdc_features.csv --target label --folds 3 --logdir logs_tabular --categoricals patient_id
-
-# Deep learning classification with hyperparameter optimization
-python scripts/torch_cv.py --meta meta/master_metadata.csv --labels three --view 4CH --phase ED --folds 2 --trials 2 --logdir logs
+python scripts/train_diag_geom.py
 ```
-
-> **💡 Tip**: Use the Makefile targets instead for easier execution:
-> ```bash
-> make ablation      # CAMUS ablation study
-> make tabular-cv    # Tabular classification
-> make torch-cv      # Deep learning classification
-> make qc-report     # Quality control report
-> make results       # Results summary
-> ```
+**Outputs (under `results/`)**
+- `acdc_diag_cm_geom.csv` — confusion matrix.
+- `acdc_diag_feature_importance.csv` — simple feature importances.
+- Console shows **Acc**, **Balanced Acc**, **Macro‑F1**.
 
 ---
 
-## 9) Reproducibility & leakage prevention
+## 8) Makefile quickstart
 
-- **Patient-level CV**: GroupKFold / StratifiedGroupKFold with groups = patient IDs.
-- **No leakage**: All encoders/scalers/SMOTE/feature selection fit **inside** training folds.
-- **Determinism**: seeds fixed (`--seed`), PyTorch seeds set in scripts.
-- **Documented env**: `environment.yml` + `requirements.txt`. Keep PyTorch installed to match your CUDA.
-- **Paths & data**: metadata (`meta/master_metadata.csv`) is updated by processing scripts and split maker.
+If you prefer one‑liners, use the included `Makefile`:
 
-> **📋 See `REPRODUCIBILITY.md`** for detailed notes on determinism, data sources, and exact reproduction steps.
+```bash
+make help                  # list targets
+make acdc                  # preprocess ACDC
+make splits                # write meta/master_metadata.csv
+make seg3d-ed              # ACDC CV (ED)
+make seg3d-es              # ACDC CV (ES)
+make oof-all               # OOF inference for ED + ES
+make features-geom         # build robust + geometric features
+make labels                # export labels to results/
+make diag-geom             # diagnosis CV with robust+geom features
+make results-md            # generate RESULTS.md
+```
+
+You can also override defaults, e.g.:
+```bash
+make seg3d PHASE=ED EPOCHS=80 CLASS_WEIGHTS=1.0,1.4,1.0 DICE_W=1.0
+```
 
 ---
 
-## 10) Makefile quickstart (recommended)
+## 9) Troubleshooting
 
-You already have a **Makefile** — great! Use it to run the common pipelines without remembering long commands.
+- **`ModuleNotFoundError: datasets`** → You forgot PYTHONPATH. Run:
+  ```bash
+  export PYTHONPATH=$(pwd):$PYTHONPATH
+  ```
+- **CUDA OOM** → Reduce `--batch-size`, increase `--accum`, or switch off some augs.
+- **Weird/negative EF** → Ensure ED/ES are correctly paired and that ACDC label ids were remapped (1→RV, 2→MYO, 3→LV → 0/1/2). The pipeline does this internally for training/eval; robust EF further mitigates outliers.
+- **Slow dataloading** → Bump `--num-workers` and ensure your data is on fast storage (SSD/NVMe).
 
-```bash
-# List all available targets (if your Makefile has a 'help' target)
-make help
-```
+---
 
-Typical targets you should have (names may vary slightly — check `make help`):
+## 10) Reproducibility & leakage prevention
 
-```bash
-# Data processing
-make camus      # Process CAMUS into cardio_data/processed/camus
-make acdc       # Process ACDC into cardio_data/processed/acdc
-make splits     # Create patient-level splits into meta/master_metadata.csv
+- **Patient-level CV** (GroupKFold) everywhere.
+- **No leakage**: any scaling/selection happens inside folds.
+- **Seeds set** in scripts; deterministic helpers where practical.
+- Documented env: `environment.yml` + `requirements.txt`.
 
-# Segmentation CV
-make seg2d      # CAMUS 2D U-Net CV (e.g., 4CH/ED, 5 folds, AMP)
-make seg3d      # ACDC 3D U-Net CV (ED, multiclass RV/MYO/LV, AMP)
-
-# Clinical classification CV
-make cls        # ACDC classification (all features); you may also have cls-ef, cls-vol
-```
-
-Use `make` wherever possible to keep your workflow reproducible and one-command simple.
+---
 
 ## 11) Citations
 
 - **CAMUS**: Leclerc, S. *et al.* “Deep Learning for Segmentation of the Left Ventricle from Echocardiographic Data.” (CAMUS dataset).
-- **ACDC**: Bernard, O. *et al.* “Deep Learning Techniques for Cardiac MR Segmentation: A Short Review.” (ACDC challenge).
-
+- **ACDC**: Bernard, O. *et al.* “Deep Learning Techniques for Cardiac MR Segmentation.” (ACDC challenge).  
 Please follow the datasets’ official citation rules in publications.
 
 ---
 
-## License
+## 12) License
 
 For academic/research use. Check dataset licenses and terms.
