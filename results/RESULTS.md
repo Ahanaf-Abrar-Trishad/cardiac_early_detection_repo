@@ -10,11 +10,11 @@
 - IoU: 0.900 ± 0.004
 
 **ACDC**  
-- Dice: 0.713 ± 0.038
-- IoU: 0.648 ± 0.031
+- Dice: 0.714 ± 0.038
+- IoU: 0.649 ± 0.032
 - Dice (RV): 0.992 ± 0.004
-- Dice (MYO): 0.496 ± 0.052
-- Dice (LV): 0.651 ± 0.080
+- Dice (MYO): 0.500 ± 0.050
+- Dice (LV): 0.651 ± 0.077
 
 
 # Ablation (Classification)
