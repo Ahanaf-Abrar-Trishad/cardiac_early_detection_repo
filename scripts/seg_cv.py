@@ -4,15 +4,19 @@ Segmentation cross-validation (patient-level) for CAMUS (2D) and ACDC (3D).
 
 - GroupKFold by patient_id (prevents leakage).
 - CAMUS → 2D U-Net (binary).
-- ACDC → 3D U-Net; --acdc-multiclass for RV/MYO/LV (3 classes).
+- ACDC → 3D U-Net.
 - Logs per-fold metrics (Dice/IoU) and summary; saves example preds.
 - Optional MLflow / W&B tracking.
-- Flags:
-  * --feat2d / --feat3d to choose UNet widths
-  * --amp to enable mixed precision (torch.amp / cuda.amp via shim)
-  * --grad-clip, --accum, --num-workers for stability/perf
+
+New in this update:
+- Per-epoch per-class Dice/IoU CSV for ACDC (--perclass-csv).
+- Validation overlay previews (--save-val-previews, --preview-batches, --preview-slice).
+- Label mapping sanity checks for ACDC (prints unique GT ids, assert on bad ids).
+- Class-weighted CE + multiclass Dice (--class-weights / --ce-weight / --dice-weight).
+- 3D augmentations for ACDC (--aug3d + intensity/flip/rotation knobs).
+- **4-class ACDC option (BG,RV,MYO,LV) via --acdc-with-bg**; metrics/CSV still reported over RV/MYO/LV only.
 """
-import argparse, json, random, math
+import argparse, json, random, math, time, csv
 from pathlib import Path
 
 import numpy as np
@@ -229,6 +233,117 @@ class DiceLoss(nn.Module):
         den = probs.sum(dim=red_dims) + targets.sum(dim=red_dims) + self.eps
         return 1 - (num / den).mean()
 
+# ---------- NEW: class weights, multiclass Dice, and 3D augmentations ----------
+def _parse_class_weights(arg_str, C):
+    """Parse class-weights string into a tensor of length C, or return 'auto'/None."""
+    if not arg_str:
+        return None
+    if arg_str.strip().lower() == "auto":
+        return "auto"
+    vals = [float(x) for x in arg_str.replace(" ", "").split(",") if x != ""]
+    assert len(vals) == C, f"--class-weights needs {C} numbers (got {len(vals)}) or 'auto'"
+    return torch.tensor(vals, dtype=torch.float32, device=DEVICE)
+
+@torch.no_grad()
+def _auto_class_weights_from_loader(loader, classes, max_batches=30):
+    """
+    Estimate class weights from label voxel frequencies.
+    classes: sequence of target class indices as used by the loss (e.g., [0,1,2] or [0,1,2,3]).
+    """
+    hist = torch.zeros(len(classes), dtype=torch.float64)
+    seen = 0
+    for b, batch in enumerate(loader):
+        msk = batch["mask"].long()  # original labels: BG=0,RV=1,MYO=2,LV=3 in ACDC
+        for i, c in enumerate(classes):
+            hist[i] += (msk == c).sum().double().item()
+        seen += 1
+        if seen >= max_batches: break
+    hist = torch.clamp(hist, min=1.0)
+    inv = 1.0 / hist
+    inv = inv / inv.mean()
+    return inv.to(torch.float32).to(DEVICE)
+
+def soft_dice_loss_multiclass(logits, target_idx, class_weights=None, eps=1e-6):
+    """
+    logits: [N,C,D,H,W], target_idx: [N,1,D,H,W] in {0..C-1}
+    returns: 1 - weighted mean Dice across classes
+    """
+    N, C = logits.shape[:2]
+    probs = torch.softmax(logits, dim=1)                      # [N,C,D,H,W]
+    tgt_oh = torch.nn.functional.one_hot(target_idx.squeeze(1).long(), num_classes=C)
+    tgt_oh = tgt_oh.permute(0,4,1,2,3).float()                # [N,C,D,H,W]
+
+    dims = (0,2,3,4)
+    inter = (probs * tgt_oh).sum(dim=dims)                    # [C]
+    denom = probs.sum(dim=dims) + tgt_oh.sum(dim=dims) + eps  # [C]
+    dice_c = (2 * inter / denom)                              # [C]
+
+    if class_weights is not None and not isinstance(class_weights, str):
+        w = class_weights / class_weights.sum()
+        loss = 1.0 - (w * dice_c).sum()
+    else:
+        loss = 1.0 - dice_c.mean()
+    return loss
+
+def _rotate_3d_z(x, angle_deg, mode="bilinear"):
+    """Rotate the 3D volume around the Z axis (in-plane rotation). x: [N,1,D,H,W]"""
+    angle = math.radians(float(angle_deg))
+    cos, sin = math.cos(angle), math.sin(angle)
+    theta = x.new_zeros((x.size(0), 3, 4))
+    theta[:,0,0] =  cos; theta[:,0,1] = -sin
+    theta[:,1,0] =  sin; theta[:,1,1] =  cos
+    theta[:,2,2] =  1.0
+    grid = torch.nn.functional.affine_grid(theta, x.size(), align_corners=False)
+    return torch.nn.functional.grid_sample(x, grid, mode=mode, padding_mode="zeros", align_corners=False)
+
+def augment3d(x, msk, *,
+              p_flip=0.5, p_rot=0.5, rot_deg=12,
+              p_gamma=0.5, gamma_min=0.9, gamma_max=1.15,
+              p_bright=0.5, bright_min=0.9, bright_max=1.1):
+    """
+    Simple, fast 3D augs for ACDC:
+      - random flips in H/W
+      - in-plane rotation around Z
+      - gamma + brightness jitter (image only)
+
+    x:   [N,1,D,H,W] float
+    msk: [N,D,H,W]   or [N,1,D,H,W] with int labels
+    """
+    import random, torch
+    def _rand(p): return random.random() < p
+
+    # ---- normalize mask shape to 5D for transforms ----
+    msk_dtype = msk.dtype
+    msk_was_4d = (msk.dim() == 4)
+    if msk_was_4d:
+        msk = msk.unsqueeze(1)  # -> [N,1,D,H,W]
+
+    # flips (H/W)
+    if _rand(p_flip):
+        x   = torch.flip(x,  dims=[-2])     # H
+        msk = torch.flip(msk, dims=[-2])
+    if _rand(p_flip):
+        x   = torch.flip(x,  dims=[-1])     # W
+        msk = torch.flip(msk, dims=[-1])
+
+    # rotation (shared for image & mask)
+    if _rand(p_rot) and rot_deg > 0:
+        ang = random.uniform(-rot_deg, rot_deg)
+        x   = _rotate_3d_z(x, ang,  mode="bilinear")
+        msk = _rotate_3d_z(msk.float(), ang, mode="nearest").round().clamp(min=0, max=3).to(msk_dtype)
+
+    # intensity jitter (image only)
+    if _rand(p_bright):
+        s = random.uniform(bright_min, bright_max); x = x * s
+    if _rand(p_gamma):
+        g = random.uniform(gamma_min, gamma_max);  x = torch.clamp(x, 0, 1) ** g
+
+    if msk_was_4d:
+        msk = msk.squeeze(1)
+
+    return x, msk
+# -------------------------------------------------------------------------------
+
 
 # ---------------- Helpers ----------------
 def save_overlay_2d(img_t, m_true_t, m_pred_t, out_png):
@@ -239,6 +354,53 @@ def save_overlay_2d(img_t, m_true_t, m_pred_t, out_png):
     plt.imshow(img, cmap='gray'); plt.imshow(mt, alpha=0.3); plt.imshow(mp, alpha=0.3)
     plt.axis('off'); plt.title(Path(out_png).stem)
     plt.savefig(out_png, bbox_inches='tight'); plt.close()
+
+def save_overlay_3d_mid(x, y_idx, pr_idx, out_png, z=None, margin=10):
+    """
+    Robust overlay:
+      - picks mid-slice (or --preview-slice),
+      - crops around the union of GT/PRED masks with a small margin,
+      - smooth image display so it isn't blocky.
+    Handles both 3-class (0..2) and 4-class (0..3 with BG=0) inputs.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from pathlib import Path
+
+    x = x.detach().cpu().numpy()[0, 0]      # [D,H,W]
+    y = y_idx.detach().cpu().numpy()[0, 0]  # [D,H,W]
+    p = pr_idx.detach().cpu().numpy()[0, 0] # [D,H,W]
+
+    D, H, W = x.shape
+    z = (D // 2) if z is None else int(np.clip(z, 0, D-1))
+
+    # which classes to draw?
+    maxlab = max(int(y.max()), int(p.max()))
+    draw_classes = [1,2,3] if maxlab >= 3 else [0,1,2]
+
+    # crop ROI from union of GT/PRED masks on this slice (non-zero labels)
+    mask_union = ((y[z] > 0) | (p[z] > 0))
+    if mask_union.any():
+        ys, xs = np.where(mask_union)
+        y0, y1 = max(0, ys.min()-margin), min(H, ys.max()+margin+1)
+        x0, x1 = max(0, xs.min()-margin), min(W, xs.max()+margin+1)
+    else:
+        cy, cx = H//2, W//2
+        y0, y1 = max(0, cy-80), min(H, cy+80)
+        x0, x1 = max(0, cx-80), min(W, cx+80)
+
+    sl_img = x[z, y0:y1, x0:x1]
+    sl_gt  = y[z, y0:y1, x0:x1]
+    sl_pr  = p[z, y0:y1, x0:x1]
+
+    fig, ax = plt.subplots(figsize=(5,5), dpi=150)
+    vmin, vmax = np.percentile(sl_img, [1, 99])
+    ax.imshow(sl_img, cmap="gray", aspect="auto", interpolation="bilinear", vmin=vmin, vmax=vmax)
+    for cls in draw_classes: ax.contour((sl_gt==cls), levels=[0.5], linewidths=1.2)
+    for cls in draw_classes: ax.contour((sl_pr==cls), levels=[0.5], linestyles="--", linewidths=1.2)
+    ax.set_axis_off(); ax.set_title(f"z={z} (solid=GT, dashed=PRED)")
+    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png); plt.close(fig)
 
 def save_nifti_pred(vol_pred, ref_path, out_path):
     ref = nib.load(ref_path)
@@ -297,6 +459,23 @@ def end_tracking(args):
         try: wandb.finish()
         except Exception: pass
 
+# ---- CSV logging for per-epoch per-class metrics (ACDC multiclass) ----
+def append_epoch_csv(csv_path, fold, epoch, val_loss, dice_list, iou_list, mean_dice_no_bg):
+    header = ["timestamp","fold","epoch","val_loss",
+              "dice_rv","dice_myo","dice_lv",
+              "iou_rv","iou_myo","iou_lv",
+              "mean_dice_no_bg"]
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    row = [int(time.time()), fold, epoch,
+           (float(val_loss) if val_loss is not None else np.nan)] + \
+          [float(x) for x in dice_list] + [float(x) for x in iou_list] + [float(mean_dice_no_bg)]
+    write_header = not csv_path.exists()
+    with open(csv_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(header)
+        w.writerow(row)
 
 # ---------------- Training Loops ----------------
 def run_fold_seg_2d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
@@ -390,11 +569,25 @@ def run_fold_seg_3d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
     loader_va = DataLoader(va_set, batch_size=1, shuffle=False, **k)
 
     feat3d = tuple(int(x) for x in args.feat3d.split(",")) if args.feat3d else (16,32,64,128)
-    out_ch = 3 if args.acdc_multiclass else 1
+    # output channels (3 or 4)
+    C = 4 if (args.acdc_multiclass and args.acdc_with_bg) else (3 if args.acdc_multiclass else 1)
+    out_ch = C
     model  = UNet3D(in_ch=1, out_ch=out_ch, feat=feat3d).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    ce     = nn.CrossEntropyLoss()
     bce    = nn.BCEWithLogitsLoss(); dice = DiceLoss()
+
+    # ---- class weights ----
+    if args.acdc_multiclass:
+        classes_for_loss = list(range(C))  # [0,1,2] or [0,1,2,3]
+        cw = _parse_class_weights(getattr(args, "class_weights", ""), C)
+        if isinstance(cw, str) and cw == "auto":
+            print("[info] computing auto class weights from training masks...")
+            cw = _auto_class_weights_from_loader(loader_tr, classes_for_loss)
+            print(f"[info] auto class weights (len={C}): {cw.tolist()}")
+        ce = nn.CrossEntropyLoss(weight=cw)
+    else:
+        cw = None
+        ce = None
 
     use_amp = bool(args.amp) and DEVICE == "cuda"
     scaler = make_scaler(use_amp)
@@ -408,17 +601,33 @@ def run_fold_seg_3d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
         for step, batch in enumerate(loader_tr, 1):
             x   = batch["image"].to(DEVICE)
             msk = batch["mask"].to(DEVICE)
+
+            # ---- 3D augmentations ----
+            if args.acdc_multiclass and args.aug3d:
+                x, msk = augment3d(
+                    x, msk,
+                    p_flip=args.p_flip, p_rot=args.p_rot, rot_deg=args.rot_deg,
+                    p_gamma=args.p_gamma, gamma_min=args.gamma_min, gamma_max=args.gamma_max,
+                    p_bright=args.p_bright, bright_min=args.bright_min, bright_max=args.bright_max
+                )
+
             with autocast_ctx(use_amp):
                 lg = model(x)
                 if args.acdc_multiclass:
-                    # map labels {1,2,3} -> {0,1,2}
-                    y_idx = torch.where(msk==3, torch.tensor(2, device=msk.device),
-                            torch.where(msk==2, torch.tensor(1, device=msk.device),
-                            torch.where(msk==1, torch.tensor(0, device=msk.device), torch.tensor(0, device=msk.device)))).long()
-                    loss = ce(lg, y_idx) / max(1, args.accum)
+                    if args.acdc_with_bg:
+                        y_idx = msk.long().clamp(min=0, max=3)   # BG=0,RV=1,MYO=2,LV=3
+                    else:
+                        # map labels {1,2,3} -> {0,1,2}; treat BG as 0 (RV)
+                        y_idx = torch.where(msk==3, torch.tensor(2, device=msk.device),
+                                torch.where(msk==2, torch.tensor(1, device=msk.device),
+                                torch.where(msk==1, torch.tensor(0, device=msk.device), torch.tensor(0, device=msk.device)))).long()
+                    ce_loss   = ce(lg, y_idx)
+                    dice_loss = soft_dice_loss_multiclass(lg, y_idx.unsqueeze(1), class_weights=cw)
+                    loss = (args.ce_weight * ce_loss + args.dice_weight * dice_loss) / max(1, args.accum)
                 else:
                     y = (msk > 0).float()
                     loss = (0.5 * bce(lg, y) + 0.5 * dice(lg, y)) / max(1, args.accum)
+
             scaler.scale(loss).backward()
             if step % args.accum == 0:
                 scaler.unscale_(optimizer)
@@ -429,28 +638,59 @@ def run_fold_seg_3d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
             train_loss += loss.item() * x.size(0); nseen += x.size(0)
 
         # validation
-        model.eval(); m = 0
+        model.eval()
+        m = 0
         dice_v = 0.0; iou_v = 0.0
         dice_classes = None; iou_classes = None
+        val_loss_sum = 0.0; val_count = 0
+
         with torch.no_grad(), autocast_ctx(use_amp):
-            for batch in loader_va:
+            for batch_idx, batch in enumerate(loader_va):
                 x   = batch["image"].to(DEVICE)
                 msk = batch["mask"].to(DEVICE)
+
+                # ---- one-time sanity on GT labels ----
+                if epoch == 1 and batch_idx == 0:
+                    uniq = torch.unique(msk).tolist()
+                    print(f"[SANITY] unique GT labels in first val batch: {uniq} (expected subset of [0,1,2,3])")
+                    assert all(int(v) in (0,1,2,3) for v in uniq), "Unexpected label id(s) in mask!"
+
                 lg  = model(x)
+
                 if args.acdc_multiclass:
-                    pr_idx = torch.argmax(lg, dim=1, keepdim=True)  # (B,1,Z,Y,X) in {0,1,2}
-                    classes = [0,1,2]
-                    pr_oh = to_one_hot(pr_idx, classes)
-                    # target 1..3 -> 0..2
-                    t_idx = torch.where(msk==3, torch.tensor(2, device=msk.device),
-                            torch.where(msk==2, torch.tensor(1, device=msk.device),
-                            torch.where(msk==1, torch.tensor(0, device=msk.device), torch.tensor(0, device=msk.device)))).unsqueeze(1)
-                    t_oh = to_one_hot(t_idx, classes)
-                    dpc = dice_per_class(pr_oh, t_oh)
-                    ipc = iou_per_class(pr_oh, t_oh)
+                    pr_idx = torch.argmax(lg, dim=1, keepdim=True)  # (B,1,D,H,W)
+
+                    # build target index tensor
+                    if args.acdc_with_bg:
+                        t_idx = msk.long().clamp(0,3).unsqueeze(1)  # includes BG
+                        score_classes = [1,2,3]                     # RV,MYO,LV
+                        val_ce_target = t_idx.squeeze(1)
+                    else:
+                        # 3-class model targets 0,1,2 (RV,MYO,LV)
+                        t_idx = torch.where(msk==3, torch.tensor(2, device=msk.device),
+                                torch.where(msk==2, torch.tensor(1, device=msk.device),
+                                torch.where(msk==1, torch.tensor(0, device=msk.device), torch.tensor(0, device=msk.device)))).unsqueeze(1)
+                        score_classes = [0,1,2]
+                        val_ce_target = t_idx.squeeze(1)
+
+                    # optional previews
+                    if args.save_val_previews and batch_idx < args.preview_batches:
+                        out_png = Path(args.logdir)/f"runs/acdc_val_previews/fold{fold_idx}/epoch{epoch}/b{batch_idx}.png"
+                        save_overlay_3d_mid(x, t_idx, pr_idx, out_png, z=(None if args.preview_slice<0 else args.preview_slice))
+
+                    # metrics (RV/MYO/LV only)
+                    pr_oh = to_one_hot(pr_idx, score_classes)
+                    t_oh  = to_one_hot(t_idx, score_classes)
+                    dpc   = dice_per_class(pr_oh, t_oh)   # (3,)
+                    ipc   = iou_per_class(pr_oh, t_oh)    # (3,)
                     dice_classes = dpc if dice_classes is None else dice_classes + dpc
                     iou_classes  = ipc if iou_classes  is None else iou_classes  + ipc
+
+                    # val CE loss for CSV
+                    val_loss_sum += ce(lg, val_ce_target.long()).item()
+                    val_count += 1
                     m += 1
+
                 else:
                     y  = (msk > 0).float()
                     pr = (torch.sigmoid(lg) >= 0.5).float()
@@ -460,8 +700,17 @@ def run_fold_seg_3d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
         if args.acdc_multiclass and m > 0:
             dice_classes = dice_classes / m  # (3,)
             iou_classes  = iou_classes  / m  # (3,)
+            drv, dmyo, dlv = [float(x) for x in dice_classes.tolist()]
+            irv, imy, ilv = [float(x) for x in iou_classes.tolist()]
             dice_v = float(dice_classes.mean().item())
             iou_v  = float(iou_classes.mean().item())
+            # ---- write per-epoch CSV ----
+            mean_no_bg = dice_v  # already mean of (RV,MYO,LV)
+            append_epoch_csv(args.perclass_csv, fold=fold_idx, epoch=epoch,
+                             val_loss=(val_loss_sum/ max(1,val_count)),
+                             dice_list=[drv, dmyo, dlv],
+                             iou_list=[irv, imy, ilv],
+                             mean_dice_no_bg=mean_no_bg)
         else:
             dice_v /= max(m, 1); iou_v /= max(m, 1)
 
@@ -475,8 +724,6 @@ def run_fold_seg_3d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
         if epoch % max(1, args.epochs // 5) == 0 or epoch == args.epochs:
             extra = ""
             if args.acdc_multiclass and m > 0:
-                drv, dmyo, dlv = [float(x) for x in dice_classes.tolist()]
-                irv, imy, ilv = [float(x) for x in iou_classes.tolist()]
                 extra = f" | RV Dice/IoU {drv:.3f}/{irv:.3f} MYO {dmyo:.3f}/{imy:.3f} LV {dlv:.3f}/{ilv:.3f}"
             print(f"[Fold {fold_idx}] Epoch {epoch:03d}/{args.epochs} | "
                   f"train_loss={(train_loss/max(1,nseen)):.4f} | dice={dice_v:.4f} iou={iou_v:.4f}{extra} | "
@@ -516,7 +763,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--meta", default="meta/master_metadata.csv")
     ap.add_argument("--dataset", choices=["camus", "acdc"], required=True)
-    ap.add_argument("--acdc-multiclass", action="store_true", help="3-class (RV/MYO/LV) segmentation for ACDC")
+    ap.add_argument("--acdc-multiclass", action="store_true", help="Multiclass segmentation for ACDC (RV/MYO/LV; add --acdc-with-bg for BG too)")
+    ap.add_argument("--acdc-with-bg", action="store_true", help="Use 4-class training for ACDC: BG=0, RV=1, MYO=2, LV=3")
     ap.add_argument("--view", default="4CH", choices=["2CH", "4CH"], help="CAMUS only")
     ap.add_argument("--phase", default="ED", choices=["ED", "ES"])
     ap.add_argument("--folds", type=int, default=5)
@@ -531,6 +779,26 @@ def main():
     ap.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clip-norm; set 0 to disable")
     ap.add_argument("--accum", type=int, default=1, help="Gradient accumulation steps")
     ap.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
+    # NEW: previews + CSV
+    ap.add_argument("--save-val-previews", action="store_true", help="Save contour overlays for first few val batches (ACDC)")
+    ap.add_argument("--preview-batches", type=int, default=3, help="How many val batches to preview when --save-val-previews")
+    ap.add_argument("--preview-slice", type=int, default=-1, help="Axial slice index to draw; <0 uses mid-slice")
+    ap.add_argument("--perclass-csv", default="results/acdc_per_class_dice.csv", help="CSV to append per-epoch per-class Dice/IoU (ACDC)")
+    # NEW: loss weighting & multiclass Dice
+    ap.add_argument("--class-weights", default="", help="3 or 4 numbers (depending on classes) or 'auto'")
+    ap.add_argument("--ce-weight", type=float, default=1.0, help="Weight for CrossEntropy in loss")
+    ap.add_argument("--dice-weight", type=float, default=0.5, help="Weight for multiclass Dice in loss")
+    # NEW: 3D augmentations
+    ap.add_argument("--aug3d", action="store_true", help="Enable 3D flips/rotations/intensity jitter (ACDC)")
+    ap.add_argument("--p-flip", type=float, default=0.5)
+    ap.add_argument("--p-rot", type=float, default=0.5)
+    ap.add_argument("--rot-deg", type=float, default=12.0)
+    ap.add_argument("--p-gamma", type=float, default=0.5)
+    ap.add_argument("--gamma-min", type=float, default=0.9)
+    ap.add_argument("--gamma-max", type=float, default=1.15)
+    ap.add_argument("--p-bright", type=float, default=0.5)
+    ap.add_argument("--bright-min", type=float, default=0.9)
+    ap.add_argument("--bright-max", type=float, default=1.1)
     # tracking
     ap.add_argument("--mlflow", action="store_true")
     ap.add_argument("--mlflow-uri", default="", dest="mlflow_uri")

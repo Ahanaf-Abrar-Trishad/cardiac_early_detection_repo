@@ -7,8 +7,10 @@ logs/
 logs_camus/
 logs_acdc/
 logs_tabular/
+logs_tabular_oof_quick/
 logs_torch/
 logs_ef/
+logs_es/
 logs_vol/
 reports/
 reports_seg/
@@ -21,12 +23,22 @@ wandb/
 *.tar
 *.zip
 
+# Keep results tracked (comment out the next line if you prefer ignoring them)
+# results/
+
 # === Python ===
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.egg-info/
+
+# === Caches ===
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
 
 # === Notebooks ===
 .ipynb_checkpoints/
