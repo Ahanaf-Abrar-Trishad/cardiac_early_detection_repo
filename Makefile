@@ -106,13 +106,7 @@ oof-all: ## ED + ES
 features-geom: ## Build robust volumes/EF + geometry to results/acdc_oof_features_geom.csv
 	$(PYTHON) scripts/build_features_geom.py
 labels: ## Export labels (patient_id, diagnosis) to results/acdc_labels.csv
-	$(PYTHON) -c "import pandas as pd, pathlib; \
-	df = pd.read_csv('meta/master_metadata.csv'); \
-	lab = df[df['dataset']=='acdc'][['patient_id','diagnosis']].drop_duplicates().sort_values('patient_id'); \
-	pathlib.Path('results').mkdir(parents=True, exist_ok=True); \
-	lab.to_csv('results/acdc_labels.csv', index=False); \
-	print('Saved results/acdc_labels.csv'); \
-	print(lab['diagnosis'].value_counts())"
+	$(PYTHON) scripts/extract_acdc_labels.py
 
 # ===== Diagnosis CV (tabular) =====
 .PHONY: diag-geom

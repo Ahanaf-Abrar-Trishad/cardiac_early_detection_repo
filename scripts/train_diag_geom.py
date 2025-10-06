@@ -20,7 +20,7 @@ def main():
     geom = pd.read_csv("results/acdc_oof_features_geom.csv")
     lab  = pd.read_csv("results/acdc_labels.csv")
     df   = geom.merge(lab, on="patient_id", how="inner")
-    df   = df[df['diagnosis']!=\"\"].copy()
+    df   = df[df['diagnosis']!=""].copy()
 
     X = df[X_COLS].values
     y = df["diagnosis"].values
