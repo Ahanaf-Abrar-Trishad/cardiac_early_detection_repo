@@ -10,7 +10,8 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, confusion_matrix
 
 X_COLS = [
-    "LVEDV_ml","LVESV_ml","LVEF_pct_robust","RVEDV_ml","RVESV_ml","RVEF_pct_robust",
+    "LVEDV_ml","LVESV_ml","LVEF_pct_robust",  # LV features (reliable)
+    # "RVEDV_ml","RVESV_ml","RVEF_pct_robust",  # RV features (removed due to poor quality in ACDC)
     "MYO_ES_to_ED_ratio","MYO_th_mean_ED_mm","MYO_th_p95_ED_mm","MYO_th_max_ED_mm",
     "MYO_th_mean_ES_mm","MYO_th_p95_ES_mm","MYO_th_max_ES_mm","MYO_th_ratio_ES_ED",
     "LV_axis23_ED","LV_axis13_ED",
