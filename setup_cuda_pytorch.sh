@@ -9,8 +9,8 @@ sudo apt install -y build-essential git git-lfs wget unzip ffmpeg libjpeg-turbo8
 if ! command -v mamba &> /dev/null; then
   echo "Installing Mambaforge..."
   wget -qO ~/Mambaforge.sh https://github.com/conda-forge/miniforge/releases/latest/download/Mambaforge-Linux-x86_64.sh
-  bash ~/Mambaforge.sh -b -p $HOME/mambaforge
-  eval "$($HOME/mambaforge/bin/conda shell.bash hook)"
+  bash ~/Mambaforge.sh -b -p "$HOME"/mambaforge
+  eval "$("$HOME"/mambaforge/bin/conda shell.bash hook)"
   conda init
 fi
 
