@@ -15,8 +15,10 @@ New in this update:
 - Class-weighted CE + multiclass Dice (--class-weights / --ce-weight / --dice-weight).
 - 3D augmentations for ACDC (--aug3d + intensity/flip/rotation knobs).
 - **4-class ACDC option (BG,RV,MYO,LV) via --acdc-with-bg**; metrics/CSV still reported over RV/MYO/LV only.
+- **Advanced models**: UNETR (Transformer), U-Net+CRAM attention
+- **New metrics**: Accuracy, F1-macro, F1-weighted for segmentation
 """
-import argparse, json, random, math, time, csv
+import argparse, json, random, math, time, csv, sys
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +29,21 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from sklearn.model_selection import GroupKFold
+from sklearn.metrics import accuracy_score, f1_score
+
+# Import advanced models
+sys.path.insert(0, str(Path(__file__).parent.parent))
+try:
+    from models.unetr import create_unetr
+    _HAS_UNETR = True
+except Exception:
+    _HAS_UNETR = False
+
+try:
+    from models.cram import UNet3DCRAM
+    _HAS_CRAM = True
+except Exception:
+    _HAS_CRAM = False
 
 # -------- AMP compat shim (new torch.amp API with fallback to cuda.amp) --------
 try:
@@ -163,7 +180,7 @@ class UNet3D(nn.Module):
         self.up1   = nn.ConvTranspose3d(feat[1], feat[0], kernel_size=(1,2,2), stride=(1,2,2))
         self.conv1 = DoubleConv3D(feat[1], feat[0])
 
-        self.out   = nn.Conv3d(feat[0], out_ch, 1)
+        self.out   = nn.Conv3d(feat[0], out_ch, kernel_size=1)
 
     @staticmethod
     def _adaptive_pool(x):
@@ -223,6 +240,33 @@ def iou_coeff(pred, target, eps=1e-6):
     inter = (pred * target).sum().item()
     union = pred.sum().item() + target.sum().item() - inter + eps
     return inter / union
+
+def compute_classification_metrics(pred_mask, true_mask, classes):
+    """
+    Compute pixel-wise accuracy and F1 for segmentation.
+    
+    Args:
+        pred_mask: predicted labels [N, D, H, W] or [N, H, W]
+        true_mask: ground truth labels [N, D, H, W] or [N, H, W]
+        classes: list of class indices (e.g., [0,1,2,3])
+    
+    Returns:
+        dict with 'accuracy', 'f1_macro', 'f1_weighted'
+    """
+    pred_flat = pred_mask.cpu().numpy().flatten()
+    true_flat = true_mask.cpu().numpy().flatten()
+    
+    acc = accuracy_score(true_flat, pred_flat)
+    
+    # F1 scores
+    f1_macro = f1_score(true_flat, pred_flat, average='macro', labels=classes, zero_division=0)
+    f1_weighted = f1_score(true_flat, pred_flat, average='weighted', labels=classes, zero_division=0)
+    
+    return {
+        'accuracy': acc,
+        'f1_macro': f1_macro,
+        'f1_weighted': f1_weighted
+    }
 
 class DiceLoss(nn.Module):
     def __init__(self, eps=1e-6): super().__init__(); self.eps = eps
@@ -334,9 +378,11 @@ def augment3d(x, msk, *,
 
     # intensity jitter (image only)
     if _rand(p_bright):
-        s = random.uniform(bright_min, bright_max); x = x * s
+        s = random.uniform(bright_min, bright_max)
+        x = x * s
     if _rand(p_gamma):
-        g = random.uniform(gamma_min, gamma_max);  x = torch.clamp(x, 0, 1) ** g
+        g = random.uniform(gamma_min, gamma_max)
+        x = torch.clamp(x, 0, 1) ** g
 
     if msk_was_4d:
         msk = msk.squeeze(1)
@@ -346,6 +392,51 @@ def augment3d(x, msk, *,
 
 
 # ---------------- Helpers ----------------
+def collate_3d_batch(batch):
+    """
+    Custom collate for 3D volumes with different shapes.
+    Pads all volumes to the max D/H/W in the batch.
+    """
+    # Find max dimensions
+    max_d = max(b["image"].shape[1] for b in batch)
+    max_h = max(b["image"].shape[2] for b in batch)
+    max_w = max(b["image"].shape[3] for b in batch)
+    
+    images = []
+    masks = []
+    labels = []
+    efs = []
+    metas = []
+    
+    for b in batch:
+        img = b["image"]  # [1, D, H, W]
+        msk = b["mask"]   # [1, D, H, W] or [D, H, W]
+        
+        # Pad image
+        d, h, w = img.shape[1], img.shape[2], img.shape[3]
+        pad = (0, max_w - w, 0, max_h - h, 0, max_d - d)
+        img_padded = torch.nn.functional.pad(img, pad, mode='constant', value=0)
+        images.append(img_padded)
+        
+        # Pad mask (ensure it's 4D [1, D, H, W])
+        if msk.dim() == 3:
+            msk = msk.unsqueeze(0)  # [D, H, W] -> [1, D, H, W]
+        msk_padded = torch.nn.functional.pad(msk, pad, mode='constant', value=0)
+        masks.append(msk_padded)
+        
+        # Collect other fields
+        labels.append(b.get("label", "NA"))
+        efs.append(b.get("ef", np.nan))
+        metas.append(b.get("meta", {}))
+    
+    return {
+        "image": torch.stack(images, dim=0),  # [N, 1, D, H, W]
+        "mask": torch.stack(masks, dim=0),     # [N, 1, D, H, W]
+        "label": labels,
+        "ef": efs,
+        "meta": metas
+    }
+
 def save_overlay_2d(img_t, m_true_t, m_pred_t, out_png):
     img = img_t.squeeze().cpu().numpy()
     mt  = m_true_t.squeeze().cpu().numpy()
@@ -437,27 +528,39 @@ def maybe_init_tracking(args):
 def track_metric(step_name, metrics: dict, args, images=None):
     if args.mlflow and _HAS_MLFLOW:
         for k, v in metrics.items():
-            try: mlflow.log_metric(k, float(v))
-            except Exception: pass
+            try:
+                mlflow.log_metric(k, v)
+            except Exception:
+                pass
         if images:
             for label, path in images.items():
-                try: mlflow.log_artifact(str(path), artifact_path=label)
-                except Exception: pass
+                try:
+                    mlflow.log_artifact(str(path), artifact_path=label)
+                except Exception:
+                    pass
     if args.wandb and _HAS_WANDB:
-        try: wandb.log(metrics)
-        except Exception: pass
+        try:
+            wandb.log(metrics)
+        except Exception:
+            pass
         if images:
             for label, path in images.items():
-                try: wandb.log({label: wandb.Image(str(path))})
-                except Exception: pass
+                try:
+                    wandb.log({label: wandb.Image(str(path))})
+                except Exception:
+                    pass
 
 def end_tracking(args):
     if args.mlflow and _HAS_MLFLOW:
-        try: mlflow.end_run()
-        except Exception: pass
+        try:
+            mlflow.end_run()
+        except Exception:
+            pass
     if args.wandb and _HAS_WANDB:
-        try: wandb.finish()
-        except Exception: pass
+        try:
+            wandb.finish()
+        except Exception:
+            pass
 
 # ---- CSV logging for per-epoch per-class metrics (ACDC multiclass) ----
 def append_epoch_csv(csv_path, fold, epoch, val_loss, dice_list, iou_list, mean_dice_no_bg):
@@ -518,6 +621,9 @@ def run_fold_seg_2d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
 
         # validation
         model.eval(); dice_v = 0.0; iou_v = 0.0; m = 0
+        val_accs = []
+        val_f1s_macro = []
+        val_f1s_weighted = []
         with torch.no_grad(), autocast_ctx(use_amp):
             for batch in loader_va:
                 x = batch["image"].to(DEVICE)
@@ -526,6 +632,17 @@ def run_fold_seg_2d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
                 for i in range(x.size(0)):
                     d = dice_coeff(pr[i], y[i]); j = iou_coeff(pr[i], y[i])
                     dice_v += d; iou_v += j; m += 1
+
+                # --- NEW: accuracy and F1 score ---
+                cls_metrics = compute_classification_metrics(
+                    pred_mask=(pr > 0.5).long(),
+                    true_mask=y,
+                    classes=[0, 1]  # binary for CAMUS
+                )
+                val_accs.append(cls_metrics['accuracy'])
+                val_f1s_macro.append(cls_metrics['f1_macro'])
+                val_f1s_weighted.append(cls_metrics['f1_weighted'])
+
         dice_v /= max(m, 1); iou_v /= max(m, 1)
 
         # save best
@@ -534,14 +651,22 @@ def run_fold_seg_2d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
             best_path = logdir / f"seg_camus_fold{fold_idx}_best.pt"
             torch.save(model.state_dict(), best_path)
 
+        # --- NEW: log accuracy and F1 ---
+        mean_acc = np.mean(val_accs)
+        mean_f1_macro = np.mean(val_f1s_macro)
+        mean_f1_weighted = np.mean(val_f1s_weighted)
+
         sched.step()
         if epoch % max(1, args.epochs // 5) == 0 or epoch == args.epochs:
             print(f"[Fold {fold_idx}] Epoch {epoch:03d}/{args.epochs} | "
                   f"train_loss={(train_loss/max(1,nseen)):.4f} | dice={dice_v:.4f} iou={iou_v:.4f} | "
+                  f"acc={mean_acc:.4f} f1={mean_f1_macro:.4f} | "
                   f"lr {optimizer.param_groups[0]['lr']:.6f}")
             if best_path is not None:
                 print(f"  ↳ best so far: {best_dice:.4f} @ {best_path.name}")
-            track_metric("val", {"dice": dice_v, "iou": iou_v, "epoch": epoch}, args)
+            track_metric("val", {"dice": dice_v, "iou": iou_v, "accuracy": mean_acc,
+                                "f1_macro": mean_f1_macro, "f1_weighted": mean_f1_weighted,
+                                "epoch": epoch}, args)
 
     # Use best checkpoint for the preview overlay if we have it
     if best_path is not None:
@@ -557,7 +682,7 @@ def run_fold_seg_2d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
     out_png = logdir / f"seg_camus_fold{fold_idx}_example.png"
     save_overlay_2d(x[0].cpu(), y[0].cpu(), pr[0].cpu(), out_png)
 
-    return float(dice_v), float(iou_v), str(out_png), None, (str(best_path) if best_path is not None else "")
+    return float(dice_v), float(iou_v), str(out_png), mean_acc, mean_f1_macro, mean_f1_weighted, (str(best_path) if best_path is not None else "")
 
 
 def run_fold_seg_3d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
@@ -565,14 +690,29 @@ def run_fold_seg_3d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
     tr_set = Subset(base, list(tr_idxs))
     va_set = Subset(base, list(va_idxs))
     k = loader_fast_kwargs(args.num_workers)
-    loader_tr = DataLoader(tr_set, batch_size=args.batch_size, shuffle=True, drop_last=True, **k)
-    loader_va = DataLoader(va_set, batch_size=1, shuffle=False, **k)
+    loader_tr = DataLoader(tr_set, batch_size=args.batch_size, shuffle=True, drop_last=True, collate_fn=collate_3d_batch, **k)
+    loader_va = DataLoader(va_set, batch_size=1, shuffle=False, collate_fn=collate_3d_batch, **k)
 
     feat3d = tuple(int(x) for x in args.feat3d.split(",")) if args.feat3d else (16,32,64,128)
     # output channels (3 or 4)
     C = 4 if (args.acdc_multiclass and args.acdc_with_bg) else (3 if args.acdc_multiclass else 1)
     out_ch = C
-    model  = UNet3D(in_ch=1, out_ch=out_ch, feat=feat3d).to(DEVICE)
+    
+    # Create model based on --model argument
+    if args.model == "unet3d_cram" and _HAS_CRAM:
+        model = UNet3DCRAM(in_ch=1, out_ch=out_ch, feat=feat3d).to(DEVICE)
+        print(f"[info] Using U-Net 3D with CRAM attention")
+    elif args.model == "unetr" and _HAS_UNETR:
+        # UNETR needs image size - use typical ACDC dimensions (small depth, large spatial)
+        model = create_unetr(in_channels=1, out_channels=out_ch, img_size=(10, 280, 280))
+        model = model.to(DEVICE)
+        print(f"[info] Using UNETR (Transformer-based)")
+    else:
+        if args.model != "unet":
+            print(f"[warning] Model '{args.model}' not available, using standard U-Net 3D")
+        model = UNet3D(in_ch=1, out_ch=out_ch, feat=feat3d).to(DEVICE)
+        print(f"[info] Using standard U-Net 3D")
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     bce    = nn.BCEWithLogitsLoss(); dice = DiceLoss()
 
@@ -600,7 +740,7 @@ def run_fold_seg_3d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
         train_loss = 0.0; nseen = 0
         for step, batch in enumerate(loader_tr, 1):
             x   = batch["image"].to(DEVICE)
-            msk = batch["mask"].to(DEVICE)
+            msk = batch["mask"].to(DEVICE).squeeze(1)  # [N, 1, D, H, W] -> [N, D, H, W]
 
             # ---- 3D augmentations ----
             if args.acdc_multiclass and args.aug3d:
@@ -644,10 +784,14 @@ def run_fold_seg_3d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
         dice_classes = None; iou_classes = None
         val_loss_sum = 0.0; val_count = 0
 
+        val_accs = []
+        val_f1s_macro = []
+        val_f1s_weighted = []
+
         with torch.no_grad(), autocast_ctx(use_amp):
             for batch_idx, batch in enumerate(loader_va):
                 x   = batch["image"].to(DEVICE)
-                msk = batch["mask"].to(DEVICE)
+                msk = batch["mask"].to(DEVICE).squeeze(1)  # [N, 1, D, H, W] -> [N, D, H, W]
 
                 # ---- one-time sanity on GT labels ----
                 if epoch == 1 and batch_idx == 0:
@@ -691,6 +835,21 @@ def run_fold_seg_3d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
                     val_count += 1
                     m += 1
 
+                    # --- NEW: accuracy and F1 score ---
+                    if args.acdc_with_bg:
+                        class_list = [0, 1, 2, 3]  # BG, RV, MYO, LV
+                    else:
+                        class_list = [0, 1, 2]  # RV, MYO, LV (remapped)
+                    
+                    cls_metrics = compute_classification_metrics(
+                        pred_mask=pr_idx.squeeze(1),
+                        true_mask=t_idx.squeeze(1),
+                        classes=class_list
+                    )
+                    val_accs.append(cls_metrics['accuracy'])
+                    val_f1s_macro.append(cls_metrics['f1_macro'])
+                    val_f1s_weighted.append(cls_metrics['f1_weighted'])
+
                 else:
                     y  = (msk > 0).float()
                     pr = (torch.sigmoid(lg) >= 0.5).float()
@@ -720,6 +879,11 @@ def run_fold_seg_3d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
             best_path = logdir / f"seg_acdc_fold{fold_idx}_best.pt"
             torch.save(model.state_dict(), best_path)
 
+        # --- NEW: log accuracy and F1 ---
+        mean_acc = np.mean(val_accs) if val_accs else 0.0
+        mean_f1_macro = np.mean(val_f1s_macro) if val_f1s_macro else 0.0
+        mean_f1_weighted = np.mean(val_f1s_weighted) if val_f1s_weighted else 0.0
+
         sched.step()
         if epoch % max(1, args.epochs // 5) == 0 or epoch == args.epochs:
             extra = ""
@@ -727,10 +891,13 @@ def run_fold_seg_3d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
                 extra = f" | RV Dice/IoU {drv:.3f}/{irv:.3f} MYO {dmyo:.3f}/{imy:.3f} LV {dlv:.3f}/{ilv:.3f}"
             print(f"[Fold {fold_idx}] Epoch {epoch:03d}/{args.epochs} | "
                   f"train_loss={(train_loss/max(1,nseen)):.4f} | dice={dice_v:.4f} iou={iou_v:.4f}{extra} | "
+                  f"acc={mean_acc:.4f} f1={mean_f1_macro:.4f} | "
                   f"lr {optimizer.param_groups[0]['lr']:.6f}")
             if best_path is not None:
                 print(f"  ↳ best so far: {best_dice:.4f} @ {best_path.name}")
-            track_metric("val", {"dice": dice_v, "iou": iou_v, "epoch": epoch}, args)
+            track_metric("val", {"dice": dice_v, "iou": iou_v, "accuracy": mean_acc,
+                                "f1_macro": mean_f1_macro, "f1_weighted": mean_f1_weighted,
+                                "epoch": epoch}, args)
 
     # Use best checkpoint for the preview NIfTI if we have it
     if best_path is not None:
@@ -753,7 +920,7 @@ def run_fold_seg_3d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
     # return per-class vectors so caller can log them
     dpc = dice_classes.cpu().numpy().tolist() if (args.acdc_multiclass and dice_classes is not None) else None
     ipc = iou_classes.cpu().numpy().tolist()  if (args.acdc_multiclass and iou_classes  is not None) else None
-    return float(dice_v), float(iou_v), str(out_pred), (dpc, ipc), (str(best_path) if best_path is not None else "")
+    return float(dice_v), float(iou_v), str(out_pred), (dpc, ipc), mean_acc, mean_f1_macro, mean_f1_weighted, (str(best_path) if best_path is not None else "")
 
 
 # ---------------- Main ----------------
@@ -763,6 +930,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--meta", default="meta/master_metadata.csv")
     ap.add_argument("--dataset", choices=["camus", "acdc"], required=True)
+    ap.add_argument("--model", default="unet", 
+                    choices=["unet", "unet3d_cram", "unetr"],
+                    help="Model architecture: unet (default), unet3d_cram (U-Net+CRAM attention), unetr (Transformer)")
     ap.add_argument("--acdc-multiclass", action="store_true", help="Multiclass segmentation for ACDC (RV/MYO/LV; add --acdc-with-bg for BG too)")
     ap.add_argument("--acdc-with-bg", action="store_true", help="Use 4-class training for ACDC: BG=0, RV=1, MYO=2, LV=3")
     ap.add_argument("--view", default="4CH", choices=["2CH", "4CH"], help="CAMUS only")
@@ -792,7 +962,7 @@ def main():
     ap.add_argument("--aug3d", action="store_true", help="Enable 3D flips/rotations/intensity jitter (ACDC)")
     ap.add_argument("--p-flip", type=float, default=0.5)
     ap.add_argument("--p-rot", type=float, default=0.5)
-    ap.add_argument("--rot-deg", type=float, default=12.0)
+    ap.add_argument("--rot-deg", type=float, default=12.0, help="Max rotation angle in degrees")
     ap.add_argument("--p-gamma", type=float, default=0.5)
     ap.add_argument("--gamma-min", type=float, default=0.9)
     ap.add_argument("--gamma-max", type=float, default=1.15)
@@ -869,14 +1039,22 @@ def main():
         va_idxs = np.array(idxs)[va]
 
         if args.dataset == "camus":
-            dice_v, iou_v, artifact, _, best_ckpt = run_fold_seg_2d(tr_idxs, va_idxs, args.phase, logdir, args, fold)
+            dice_v, iou_v, artifact, acc_v, f1_macro_v, f1_weighted_v, best_ckpt = run_fold_seg_2d(tr_idxs, va_idxs, args.phase, logdir, args, fold)
             dpc = ipc = None
         else:
-            dice_v, iou_v, artifact, tpl, best_ckpt = run_fold_seg_3d(tr_idxs, va_idxs, args.phase, logdir, args, fold)
+            dice_v, iou_v, artifact, tpl, acc_v, f1_macro_v, f1_weighted_v, best_ckpt = run_fold_seg_3d(tr_idxs, va_idxs, args.phase, logdir, args, fold)
             dpc, ipc = tpl if tpl is not None else (None, None)
 
-        print(f"[Fold {fold}] Dice={dice_v:.4f} IoU={iou_v:.4f}")
-        row = {"fold": fold, "Dice": dice_v, "IoU": iou_v, "artifact": artifact}
+        print(f"[Fold {fold}] Dice={dice_v:.4f} IoU={iou_v:.4f} Acc={acc_v:.4f} F1-macro={f1_macro_v:.4f}")
+        row = {
+            "fold": fold, 
+            "Dice": dice_v, 
+            "IoU": iou_v, 
+            "Accuracy": acc_v,
+            "F1_macro": f1_macro_v,
+            "F1_weighted": f1_weighted_v,
+            "artifact": artifact
+        }
         if best_ckpt:
             row["best_ckpt"] = best_ckpt
         if args.dataset == "acdc" and args.acdc_multiclass and dpc is not None and ipc is not None:
@@ -888,20 +1066,29 @@ def main():
         metrics.append(row)
 
         track_metric("fold_end",
-                     {"fold_dice": dice_v, "fold_iou": iou_v, "fold": fold},
+                     {"fold_dice": dice_v, "fold_iou": iou_v, "fold_accuracy": acc_v,
+                      "fold_f1_macro": f1_macro_v, "fold_f1_weighted": f1_weighted_v, "fold": fold},
                      args,
                      images={f"{args.dataset}_fold{fold}": artifact})
 
     # Summary
     d = np.array([m["Dice"] for m in metrics], dtype=float)
     j = np.array([m["IoU"]  for m in metrics if not np.isnan(m["IoU"])], dtype=float) if any(not np.isnan(m["IoU"]) for m in metrics) else np.array([])
+    a = np.array([m["Accuracy"] for m in metrics], dtype=float)
+    f1m = np.array([m["F1_macro"] for m in metrics], dtype=float)
+    f1w = np.array([m["F1_weighted"] for m in metrics], dtype=float)
+    
     summary = {
         "Dice_mean": float(np.nanmean(d)), "Dice_std": float(np.nanstd(d)),
         "IoU_mean":  float(np.mean(j)) if j.size>0 else float('nan'),
         "IoU_std":   float(np.std(j))  if j.size>0 else float('nan'),
+        "Accuracy_mean": float(np.nanmean(a)), "Accuracy_std": float(np.nanstd(a)),
+        "F1_macro_mean": float(np.nanmean(f1m)), "F1_macro_std": float(np.nanstd(f1m)),
+        "F1_weighted_mean": float(np.nanmean(f1w)), "F1_weighted_std": float(np.nanstd(f1w)),
         "folds": len(metrics), "dataset": args.dataset, "phase": args.phase, "view": args.view,
         "feat2d": args.feat2d, "feat3d": args.feat3d, "amp": args.amp,
-        "grad_clip": args.grad_clip, "accum": args.accum, "num_workers": args.num_workers
+        "grad_clip": args.grad_clip, "accum": args.accum, "num_workers": args.num_workers,
+        "model": args.model
     }
     if args.dataset == "acdc" and args.acdc_multiclass:
         pdf = pd.DataFrame(metrics)
@@ -911,8 +1098,11 @@ def main():
                 summary[col + "_std"]  = float(pdf[col].std())
 
     print("\n=== CV Summary ===")
-    print(f"Dice mean±std: {summary['Dice_mean']:.4f} ± {summary['Dice_std']:.4f}")
-    print(f"IoU  mean±std: {summary['IoU_mean']:.4f} ± {summary['IoU_std']:.4f}")
+    print(f"Dice      mean±std: {summary['Dice_mean']:.4f} ± {summary['Dice_std']:.4f}")
+    print(f"IoU       mean±std: {summary['IoU_mean']:.4f} ± {summary['IoU_std']:.4f}")
+    print(f"Accuracy  mean±std: {summary['Accuracy_mean']:.4f} ± {summary['Accuracy_std']:.4f}")
+    print(f"F1-macro  mean±std: {summary['F1_macro_mean']:.4f} ± {summary['F1_macro_std']:.4f}")
+    print(f"F1-weight mean±std: {summary['F1_weighted_mean']:.4f} ± {summary['F1_weighted_std']:.4f}")
 
     # Save artifacts
     logdir = Path(args.logdir)

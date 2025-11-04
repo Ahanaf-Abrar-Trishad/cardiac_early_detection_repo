@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, json
+import argparse, json, sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -8,9 +8,19 @@ from torch.utils.data import DataLoader, Subset
 from sklearn.model_selection import GroupKFold
 import nibabel as nib
 
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 # --- import your repo code ---
 from datasets.acdc_ed_es_3d import ACDC3DEDS
-from scripts.seg_cv import UNet3D, set_all_seeds, loader_fast_kwargs, DEVICE
+from scripts.seg_cv import UNet3D, set_all_seeds, loader_fast_kwargs, collate_3d_batch, DEVICE
+
+# Import advanced models
+try:
+    from models.cram import UNet3DCRAM
+    _HAS_CRAM = True
+except Exception:
+    _HAS_CRAM = False
 
 @torch.no_grad()
 def save_nifti_pred(vol_pred, ref_path, out_path):
@@ -53,11 +63,22 @@ def run_oof(meta, phase, folds, feat3d, logdir, ckpt_pattern, oof_dir, batch_siz
         print(f"== OOF infer {phase} | fold {fold} ==")
         va_idxs = np.array(idxs)[va]
         va_set  = Subset(base, list(va_idxs))
-        loader  = DataLoader(va_set, batch_size=batch_size, shuffle=False, **loader_fast_kwargs(num_workers=2))
+        loader  = DataLoader(va_set, batch_size=batch_size, shuffle=False, 
+                            collate_fn=collate_3d_batch, **loader_fast_kwargs(num_workers=2))
 
-        # model
-        model = UNet3D(in_ch=1, out_ch=out_ch, feat=feat).to(DEVICE)
+        # model - detect model type from checkpoint
         state = torch.load(ckpt_path, map_location=DEVICE)
+        
+        # Check if checkpoint is from CRAM model
+        is_cram = any('cram' in k for k in state.keys())
+        
+        if is_cram and _HAS_CRAM:
+            model = UNet3DCRAM(in_ch=1, out_ch=out_ch, feat=feat).to(DEVICE)
+            print(f"  [info] Loading CRAM model checkpoint")
+        else:
+            model = UNet3D(in_ch=1, out_ch=out_ch, feat=feat).to(DEVICE)
+            print(f"  [info] Loading standard UNet3D checkpoint")
+        
         model.load_state_dict(state)
         model.eval()
         use_amp = bool(amp) and DEVICE == "cuda"
