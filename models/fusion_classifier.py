@@ -149,12 +149,12 @@ class FeatureFusionClassifier(nn.Module):
         # Classification head
         self.classifier = nn.Linear(hidden_dim, num_classes)
     
-    def forward(self, geometric, ef, volume):
+    def forward(self, geometric, ef, volume=None):
         """
         Args:
             geometric: [B, geometric_dim]
             ef: [B, ef_dim]
-            volume: [B, vol_dim]
+            volume: [B, vol_dim] (optional, if None uses zeros)
         
         Returns:
             logits: [B, num_classes]
@@ -162,6 +162,11 @@ class FeatureFusionClassifier(nn.Module):
         # Project features through RAP blocks
         geo_feat = self.geo_proj(geometric)
         ef_feat = self.ef_proj(ef)
+        
+        # Handle optional volume input
+        if volume is None:
+            volume = torch.zeros(geometric.shape[0], self.vol_proj[0].in_features, 
+                                device=geometric.device, dtype=geometric.dtype)
         vol_feat = self.vol_proj(volume)
         
         if self.use_cross_attention:
