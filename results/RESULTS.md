@@ -132,6 +132,48 @@
 - **MYO**: 45.82% ± 3.20%
 - **LV**: 70.28% ± 6.16%
 
+**Per-Fold Breakdown (ACDC)**:
+
+| Fold | Overall Dice | RV Dice | MYO Dice | LV Dice | Overall IoU | Pixel Acc |
+|------|--------------|---------|----------|---------|-------------|-----------|
+| 1 | 64.11% | 63.50% | 58.17% | 70.65% | 52.05% | 96.19% |
+| 2 | 67.09% | 61.29% | 61.42% | 78.58% | 54.42% | 96.47% |
+| 3 | 63.10% | 61.21% | 56.13% | 71.97% | 51.37% | 97.35% |
+| 4 | 71.82% | 66.91% | 64.39% | 84.17% | 60.08% | 97.71% |
+| 5 | 70.87% | 68.13% | 62.30% | 82.17% | 58.95% | 97.58% |
+| **Mean** | **67.40%** | **64.21%** | **60.48%** | **77.51%** | **55.38%** | **97.06%** |
+| **Std** | **3.49%** | **3.19%** | **3.31%** | **6.02%** | **3.55%** | **0.61%** |
+
+**Per-Fold Breakdown (CAMUS)**:
+
+| Fold | Dice | IoU | Pixel Acc | F1 Macro | F1 Weighted |
+|------|------|-----|-----------|----------|-------------|
+| 1 | 94.40% | 89.49% | 97.61% | 96.47% | 97.61% |
+| 2 | 94.28% | 89.28% | 97.50% | 96.41% | 97.49% |
+| 3 | 93.93% | 88.71% | 97.42% | 96.19% | 97.42% |
+| 4 | 93.76% | 88.59% | 97.37% | 96.19% | 97.35% |
+| 5 | 93.85% | 88.61% | 97.43% | 96.23% | 97.45% |
+| **Mean** | **94.05%** | **88.94%** | **97.47%** | **96.30%** | **97.47%** |
+| **Std** | **0.25%** | **0.37%** | **0.08%** | **0.12%** | **0.09%** |
+
+### Segmentation Performance Comparison
+
+| Dataset | Task | Model | Dice | IoU | Difficulty | Key Challenge |
+|---------|------|-------|------|-----|------------|---------------|
+| **CAMUS** | Binary LV | 2D U-Net | **94.05%** | **88.94%** | Easy | Well-defined boundaries |
+| **ACDC - LV** | Multi-class | 3D U-Net+CRAM | **77.51%** | **70.28%** | Moderate | Large structure, clear contrast |
+| **ACDC - RV** | Multi-class | 3D U-Net+CRAM | 64.21% | 50.03% | Hard | Thin anterior wall |
+| **ACDC - MYO** | Multi-class | 3D U-Net+CRAM | 60.48% | 45.82% | Very Hard | Thin tissue, variable intensity |
+
+**Key Observations**:
+1. **CAMUS** achieves excellent performance (94% Dice) with very low variance (0.25% std)
+2. **ACDC multi-class** is significantly more challenging:
+   - Binary (CAMUS) vs. 4-class (ACDC): ~27% Dice difference
+   - Thin structures (MYO: 8-12mm) harder to segment than large chambers
+   - 3D adds complexity: depth dimension variation (7-12 slices)
+3. **Fold 4 & 5** show best ACDC performance (71-72% Dice), suggesting some patient variation
+4. **Pixel accuracy** remains high (>96%) even with moderate Dice, indicating class imbalance
+
 ---
 
 ## 🏗️ Model Architectures
