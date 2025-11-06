@@ -2,7 +2,11 @@
 
 ## Overview
 
-This document describes the complete feature extraction pipeline for the ACDC Cardiac Early Detection project. The pipeline extracts **8 clinical features** from cardiac MRI segmentation masks to enable automated pathology classification.
+This document describes the complete feature extraction pipeline for the ACDC Cardiac Early Detection project. The pipeline extracts clinical features from two datasets:
+- **ACDC Dataset**: 8 volumetric + functional features from 3D cardiac MRI
+- **CAMUS Dataset**: Ejection Fraction (EF) values from 2D echocardiography
+
+These features enable automated cardiac pathology classification with 92.67% accuracy.
 
 ---
 
@@ -24,7 +28,7 @@ graph TD
 
 ## Feature Set
 
-### Summary Table
+### ACDC Features (3D Cardiac MRI)
 
 | Feature | Type | Description | Clinical Significance |
 |---------|------|-------------|----------------------|
@@ -37,7 +41,21 @@ graph TD
 | `LV_EF` | Functional | Left Ventricle Ejection Fraction | Pumping efficiency (0-1) |
 | `RV_EF` | Functional | Right Ventricle Ejection Fraction | Right side pumping efficiency |
 
-**Total Features**: 6 volumetric + 2 functional = **8 features**
+**ACDC Total**: 6 volumetric + 2 functional = **8 features**
+
+### CAMUS Features (2D Echocardiography)
+
+| Feature | Type | Description | Clinical Significance |
+|---------|------|-------------|----------------------|
+| `ef_lv` | Functional | Left Ventricle Ejection Fraction (%) | Pumping efficiency from echo |
+| `ef_bin` | Categorical | EF category (normal/mid/reduced) | Clinical heart failure classification |
+
+**CAMUS Total**: 1 continuous + 1 categorical = **2 features**
+
+**Categories**:
+- `normal`: EF ≥ 55% (healthy heart function)
+- `mid`: 40% ≤ EF < 55% (mildly reduced)
+- `reduced`: EF < 40% (heart failure indicator)
 
 ---
 
@@ -287,6 +305,97 @@ patient003,276.27,192.02,192.70,241.52,174.97,200.23,0.126,0.089,DCM
 
 ---
 
+### Step 6: CAMUS Ejection Fraction Extraction
+
+**Script**: `scripts/extract_camus_ef.py`
+
+**Purpose**: Extract EF values from CAMUS dataset Info files
+
+**Background**: 
+CAMUS (Cardiac Acquisitions for Multi-structure Ultrasound Segmentation) provides 2D echocardiography data with pre-calculated EF values stored in configuration files. Unlike ACDC where we calculate EF from segmentation masks, CAMUS provides ground truth EF directly.
+
+**Input**: CAMUS `Info_{view}.cfg` files containing:
+```ini
+ED: 12
+ES: 1
+NbFrame: 1
+ImageQuality: Good
+LVedv: 68.0
+LVesv: 22.0
+EF: 67.6
+```
+
+**Algorithm**:
+```python
+def extract_camus_ef(info_path):
+    """
+    Extract EF from CAMUS Info file
+    
+    Args:
+        info_path: Path to Info_4CH.cfg or Info_2CH.cfg
+    
+    Returns:
+        EF value (percentage) and categorical label
+    """
+    # 1. Read Info file
+    with open(info_path, 'r') as f:
+        for line in f:
+            if line.startswith('EF:'):
+                ef_value = float(line.split(':')[1].strip())
+    
+    # 2. Categorize based on clinical thresholds
+    if ef_value >= 55:
+        category = "normal"      # Healthy heart
+    elif ef_value >= 40:
+        category = "mid"         # Mildly reduced
+    else:
+        category = "reduced"     # Heart failure
+    
+    return ef_value, category
+```
+
+**Execution**:
+```bash
+python scripts/extract_camus_ef.py \
+    --meta meta/master_metadata.csv \
+    --raw-camus cardio_data/raw/camus \
+    --output meta/master_metadata.csv  # Updates in-place
+```
+
+**Output**: 
+Updates `master_metadata.csv` with two new columns:
+- `ef_lv`: Continuous EF value (e.g., 67.6%)
+- `ef_bin`: Categorical label (normal/mid/reduced)
+
+**Example Data**:
+```csv
+dataset,patient_id,study_id,view,phase,ef_lv,ef_bin
+camus,patient0001,patient0001_4CH,4CH,ED,54.0,mid
+camus,patient0002,patient0002_4CH,4CH,ED,40.0,mid
+camus,patient0003,patient0003_2CH,2CH,ED,68.5,normal
+camus,patient0050,patient0050_4CH,4CH,ED,35.2,reduced
+```
+
+**Distribution Summary**:
+```
+CAMUS EF Label Distribution:
+  normal:  ~250 studies (EF ≥ 55%)
+  mid:     ~120 studies (40% ≤ EF < 55%)
+  reduced: ~80 studies (EF < 40%)
+```
+
+**Key Differences from ACDC**:
+
+| Aspect | ACDC | CAMUS |
+|--------|------|-------|
+| Modality | 3D Cardiac MRI | 2D Echocardiography |
+| EF Source | Calculated from segmentation | Pre-calculated (ground truth) |
+| Views | Short-axis slices | 2CH and 4CH apical views |
+| Features | 8 (volumes + EF) | 2 (EF value + category) |
+| Segmentation | RV, MYO, LV (3 structures) | LV endocardium only |
+
+---
+
 ## Complete Pipeline Execution
 
 ### Automated Workflow
@@ -294,23 +403,30 @@ patient003,276.27,192.02,192.70,241.52,174.97,200.23,0.126,0.089,DCM
 **Script**: `run_feature_extraction.sh`
 
 ```bash
+**Script**: `run_feature_extraction.sh`
+
+```bash
 #!/bin/bash
 # Complete feature extraction workflow
 
-# Step 1: Generate OOF predictions for ED phase
+# Step 1: Generate OOF predictions for ED phase (ACDC)
 python scripts/oof_infer_acdc.py --phase ED --folds 5 --with-bg
 
-# Step 2: Generate OOF predictions for ES phase  
+# Step 2: Generate OOF predictions for ES phase (ACDC)
 python scripts/oof_infer_acdc.py --phase ES --folds 5 --with-bg
 
 # Step 3: Extract volumetric features from ACDC segmentation
 python scripts/extract_features_acdc.py
 
-# Step 4: Extract ejection fraction from ACDC
+# Step 4: Extract EF from ACDC
 python scripts/extract_acdc_ef.py
 
-# Step 5: Build geometric features (advanced)
+# Step 5: Extract EF from CAMUS (reads from Info files)
+python scripts/extract_camus_ef.py
+
+# Step 6: Build advanced geometric features (optional)
 python scripts/build_features_geom.py
+```
 ```
 
 **Execution**:
@@ -854,42 +970,94 @@ pip freeze > requirements_exact.txt
 
 ### Key Takeaways
 
-1. **8 Clinical Features** extracted from cardiac MRI segmentation
-   - 6 volumetric (chamber sizes at ED/ES)
-   - 2 functional (ejection fractions)
+1. **Two Datasets, Complementary Features**:
+   - **ACDC**: 8 clinical features from 3D cardiac MRI (volumetric + functional)
+   - **CAMUS**: 2 features from 2D echocardiography (EF + categorical)
 
-2. **Out-of-Fold Strategy** ensures no data leakage
+2. **ACDC Feature Extraction**:
+   - 6 volumetric features (chamber sizes at ED/ES)
+   - 2 functional features (ejection fractions)
+   - Derived from automated segmentation (U-Net + CRAM)
+
+3. **CAMUS Feature Extraction**:
+   - Ground truth EF from Info configuration files
+   - Categorical classification (normal/mid/reduced)
+   - Direct clinical heart failure indicator
+
+4. **Out-of-Fold Strategy** ensures no data leakage:
    - Predictions from models that never trained on that patient
    - Mimics real deployment scenario
 
-3. **Robust Implementation** with error handling
+5. **Robust Implementation** with error handling:
    - Physiological validation ranges
    - Automatic outlier detection
    - Fallback mechanisms for missing data
 
-4. **Clinical Relevance**
+6. **Clinical Relevance**:
    - Features directly interpretable by cardiologists
    - Aligned with standard cardiac function metrics
-   - Enables 92.67% accurate pathology classification
+   - Enables 92.67% accurate pathology classification (ACDC)
+   - Enables heart failure detection (CAMUS)
 
 ### Files Generated
 
 ```
-meta/acdc_features.csv              # Main feature table (8 features)
-results/acdc_oof_index_ED.csv       # ED prediction metadata
-results/acdc_oof_index_ES.csv       # ES prediction metadata
-results/acdc_oof_features_geom.csv  # Extended geometric features
-logs/oof_preds/ED/*.nii.gz          # ED segmentation predictions
-logs/oof_preds/ES/*.nii.gz          # ES segmentation predictions
+ACDC Features:
+├── meta/acdc_features.csv              # Main feature table (8 features)
+├── results/acdc_oof_index_ED.csv       # ED prediction metadata
+├── results/acdc_oof_index_ES.csv       # ES prediction metadata
+├── results/acdc_oof_features_geom.csv  # Extended geometric features (17)
+├── logs/oof_preds/ED/*.nii.gz          # ED segmentation predictions
+└── logs/oof_preds/ES/*.nii.gz          # ES segmentation predictions
+
+CAMUS Features:
+└── meta/master_metadata.csv            # Updated with ef_lv, ef_bin columns
 ```
 
 ### Next Steps
 
 **Use extracted features for**:
-- ✅ Training classification models
+- ✅ Training classification models (ACDC: 8 features, CAMUS: 2 features)
 - ✅ Statistical analysis of pathology groups
+- ✅ Multi-modal fusion (combining MRI + Echo features)
 - ✅ Clinical decision support systems
 - ✅ Longitudinal patient monitoring
+
+---
+
+## Dataset Comparison
+
+### ACDC vs CAMUS
+
+| Feature | ACDC | CAMUS |
+|---------|------|-------|
+| **Modality** | 3D Cardiac MRI | 2D Echocardiography |
+| **Acquisition** | CMR short-axis stack | Apical 2CH/4CH views |
+| **Patients** | 150 | 500 |
+| **Pathologies** | 5 classes (DCM, HCM, MINF, NOR, RV) | EF-based (normal/mid/reduced) |
+| **Structures** | RV, MYO, LV (3 chambers) | LV endocardium only |
+| **Resolution** | ~256×256×10 slices | 256×256 single slice |
+| **Features** | 8 (6 volumetric + 2 EF) | 2 (1 EF + 1 category) |
+| **EF Calculation** | Derived from segmentation | Ground truth from Info files |
+| **Primary Use** | Pathology classification | Heart failure detection |
+
+### Why Both Datasets?
+
+1. **Complementary Information**:
+   - ACDC: Rich volumetric features (chamber sizes, muscle mass)
+   - CAMUS: Ground truth EF for validation
+
+2. **Different Modalities**:
+   - MRI: High resolution, 3D structure
+   - Echo: Fast, portable, widely available clinically
+
+3. **Cross-Modal Validation**:
+   - Compare ACDC-derived EF vs CAMUS ground truth EF
+   - Validate segmentation-based features
+
+4. **Multi-Modal Fusion**:
+   - Combine MRI volumes with Echo EF for robust classification
+   - Leverage strengths of both imaging modalities
 
 ---
 
