@@ -222,3 +222,19 @@ Please follow the datasets’ official citation rules in publications.
 ## 12) License
 
 For academic/research use. Check dataset licenses and terms.
+
+---
+
+## 13) Documentation
+
+All detailed documentation is organized in the **`docs/`** folder:
+
+- **[docs/README.md](docs/README.md)** - Complete documentation index
+- **[docs/QUICK_START.md](docs/QUICK_START.md)** - Quick start guide
+- **[docs/TRAINING_READY_SUMMARY.md](docs/TRAINING_READY_SUMMARY.md)** - Training setup
+- **[docs/ATTENTION_TRAINING_GUIDE.md](docs/ATTENTION_TRAINING_GUIDE.md)** - Attention models guide
+- **[docs/PIPELINE.md](docs/PIPELINE.md)** - Full pipeline documentation
+- **[docs/RESULTS.md](docs/RESULTS.md)** - Experimental results
+
+See **[docs/README.md](docs/README.md)** for the complete documentation index.
+
