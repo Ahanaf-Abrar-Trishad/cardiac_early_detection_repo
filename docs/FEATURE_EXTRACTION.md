@@ -1081,13 +1081,13 @@ CAMUS Features:
 
 For questions about the feature extraction pipeline:
 1. Check `PIPELINE.md` for command reference
-2. Review `QUICK_REFERENCE.md` for common workflows
+2. Review `QUICK_START.md` for common workflows
 3. See `RESULTS.md` for expected outputs
 
 **Pipeline Execution**:
 ```bash
 # Complete automated workflow
-./run_full_pipeline.sh
+make features-geom
 
 # Or step-by-step
 ./run_feature_extraction.sh

@@ -1,6 +1,5 @@
 #!/bin/bash
-# Train Advanced Attention-Based Classifiers
-# This script trains both the AdvancedAttentionClassifier and MultiModalAttentionClassifier
+# Train Attention-Based Classifiers (advanced, multimodal, tabular transformer, graph)
 
 set -e  # Exit on error
 
@@ -22,6 +21,16 @@ DROPOUT=0.3
 PATIENCE=30
 SEED=42
 LOGDIR="logs"
+# Tabular Transformer defaults
+TT_D_MODEL=320
+TT_DEPTH=6
+TT_HEADS=8
+TT_DROPOUT=0.3
+# Graph defaults
+GRAPH_HIDDEN=128
+GRAPH_HEADS=4
+GRAPH_LAYERS=2
+GRAPH_DROPOUT=0.2
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -71,8 +80,40 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --model)
-            # Only train specific model (advanced or multimodal)
+            # Only train specific model (advanced, multimodal, tabular_transformer)
             ONLY_MODEL="$2"
+            shift 2
+            ;;
+        --tt-d-model)
+            TT_D_MODEL="$2"
+            shift 2
+            ;;
+        --tt-depth)
+            TT_DEPTH="$2"
+            shift 2
+            ;;
+        --tt-heads)
+            TT_HEADS="$2"
+            shift 2
+            ;;
+        --tt-dropout)
+            TT_DROPOUT="$2"
+            shift 2
+            ;;
+        --graph-hidden)
+            GRAPH_HIDDEN="$2"
+            shift 2
+            ;;
+        --graph-heads)
+            GRAPH_HEADS="$2"
+            shift 2
+            ;;
+        --graph-layers)
+            GRAPH_LAYERS="$2"
+            shift 2
+            ;;
+        --graph-dropout)
+            GRAPH_DROPOUT="$2"
             shift 2
             ;;
         --verbose)
@@ -94,7 +135,15 @@ while [[ $# -gt 0 ]]; do
             echo "  --patience N          Early stopping patience (default: 30)"
             echo "  --seed N              Random seed (default: 42)"
             echo "  --logdir PATH         Output directory (default: logs)"
-            echo "  --model TYPE          Train only specific model: 'advanced' or 'multimodal'"
+            echo "  --model TYPE          Train only specific model: 'advanced', 'multimodal', 'tabular_transformer', or 'graph'"
+            echo "  --tt-d-model N        Tabular Transformer width (default: 320)"
+            echo "  --tt-depth N          Tabular Transformer layers (default: 6)"
+            echo "  --tt-heads N          Tabular Transformer heads (default: 8)"
+            echo "  --tt-dropout FLOAT    Tabular Transformer dropout (default: 0.3)"
+            echo "  --graph-hidden N      Graph classifier hidden dim (default: 128)"
+            echo "  --graph-heads N       Graph classifier attention heads (default: 4)"
+            echo "  --graph-layers N      Graph classifier layers (default: 2)"
+            echo "  --graph-dropout FLOAT Graph classifier dropout (default: 0.2)"
             echo "  --verbose             Print detailed training progress"
             echo "  --help                Show this help message"
             exit 0
@@ -134,6 +183,16 @@ mkdir -p "$LOGDIR"
 # Function to train a model
 train_model() {
     local model_type=$1
+    local extra_flags=()
+    if [[ "$model_type" == "tabular_transformer" ]]; then
+        extra_flags+=(--model-type tabular_transformer)
+        extra_flags+=(--tt-d-model $TT_D_MODEL --tt-depth $TT_DEPTH --tt-heads $TT_HEADS --tt-dropout $TT_DROPOUT)
+    elif [[ "$model_type" == "graph" ]]; then
+        extra_flags+=(--model-type graph)
+        extra_flags+=(--graph-hidden $GRAPH_HIDDEN --graph-heads $GRAPH_HEADS --graph-layers $GRAPH_LAYERS --graph-dropout $GRAPH_DROPOUT)
+    else
+        extra_flags+=(--model-type "$model_type")
+    fi
     echo ""
     echo "============================================"
     echo "Training $model_type Attention Classifier"
@@ -142,7 +201,6 @@ train_model() {
     
     python scripts/train_attention_classifier.py \
         --features "$FEATURES" \
-        --model-type "$model_type" \
         --folds $FOLDS \
         --epochs $EPOCHS \
         --batch-size $BATCH_SIZE \
@@ -155,6 +213,7 @@ train_model() {
         --patience $PATIENCE \
         --seed $SEED \
         --logdir "$LOGDIR" \
+        "${extra_flags[@]}" \
         $VERBOSE
     
     if [ $? -eq 0 ]; then
@@ -169,9 +228,11 @@ train_model() {
 
 # Train models
 if [ -z "$ONLY_MODEL" ]; then
-    # Train both models
+    # Train all models
     train_model "advanced"
     train_model "multimodal"
+    train_model "tabular_transformer"
+    train_model "graph"
 else
     # Train only specified model
     train_model "$ONLY_MODEL"
@@ -187,14 +248,20 @@ echo ""
 echo "Summary files:"
 echo "  - $LOGDIR/attention_advanced_cv_summary.json"
 echo "  - $LOGDIR/attention_multimodal_cv_summary.json"
+echo "  - $LOGDIR/attention_tabular_transformer_cv_summary.json"
+echo "  - $LOGDIR/attention_graph_cv_summary.json"
 echo ""
 echo "Model checkpoints:"
 echo "  - $LOGDIR/attention_advanced_fold*_best.pt"
 echo "  - $LOGDIR/attention_multimodal_fold*_best.pt"
+echo "  - $LOGDIR/attention_tabular_transformer_fold*_best.pt"
+echo "  - $LOGDIR/attention_graph_fold*_best.pt"
 echo ""
 echo "Out-of-fold predictions:"
 echo "  - $LOGDIR/oof_preds/attention_advanced_oof_predictions.csv"
 echo "  - $LOGDIR/oof_preds/attention_multimodal_oof_predictions.csv"
+echo "  - $LOGDIR/oof_preds/attention_tabular_transformer_oof_predictions.csv"
+echo "  - $LOGDIR/oof_preds/attention_graph_oof_predictions.csv"
 echo ""
 
 # Compare with existing results if available

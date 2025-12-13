@@ -27,12 +27,60 @@ from torch.utils.data import Dataset, DataLoader
 from scipy import stats
 
 import sys
+
 sys.path.append(str(Path(__file__).parent.parent))
 from models.advanced_attention_classifier import (
     AdvancedAttentionClassifier,
-    MultiModalAttentionClassifier
+    MultiModalAttentionClassifier,
 )
 from models.tabular_transformer import TabularTransformerClassifier
+from models.graph_classifier import GraphClassifier
+
+
+def build_argparser():
+    parser = argparse.ArgumentParser(description="Train Attention Classifiers")
+
+    # Data arguments
+    parser.add_argument("--features", default="meta/acdc_features.csv", help="Path to features CSV")
+    parser.add_argument("--folds", type=int, default=5, help="Number of CV folds")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+
+    # Model arguments
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default="advanced",
+        choices=["advanced", "multimodal", "tabular_transformer", "graph"],
+        help="Model architecture: 'advanced' (single input), 'multimodal' (geo+func), 'tabular_transformer' (grouped tokens), or 'graph' (GAT over tokens)",
+    )
+    parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden dimension")
+    parser.add_argument("--num-blocks", type=int, default=4, help="Number of attention blocks")
+    parser.add_argument("--num-heads", type=int, default=8, help="Number of attention heads")
+    parser.add_argument("--mlp-ratio", type=float, default=4.0, help="MLP expansion ratio")
+    parser.add_argument("--dropout", type=float, default=0.3, help="Dropout rate")
+    parser.add_argument("--tt-d-model", type=int, default=256, help="Transformer width for tabular model")
+    parser.add_argument("--tt-depth", type=int, default=4, help="Transformer layers for tabular model")
+    parser.add_argument("--tt-heads", type=int, default=8, help="Attention heads for tabular model")
+    parser.add_argument("--tt-dropout", type=float, default=0.3, help="Dropout for tabular model")
+    # Graph model
+    parser.add_argument("--graph-hidden", type=int, default=128, help="Hidden dim for graph classifier")
+    parser.add_argument("--graph-heads", type=int, default=4, help="Attention heads for graph classifier")
+    parser.add_argument("--graph-layers", type=int, default=2, help="GAT layers for graph classifier")
+    parser.add_argument("--graph-dropout", type=float, default=0.2, help="Dropout for graph classifier")
+
+    # Training arguments
+    parser.add_argument("--epochs", type=int, default=150, help="Number of epochs")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay (L2 regularization)")
+    parser.add_argument("--patience", type=int, default=30, help="Early stopping patience")
+
+    # System arguments
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--logdir", default="logs", help="Output directory")
+    parser.add_argument("--verbose", action="store_true", help="Print detailed training progress")
+
+    return parser
 
 
 class SingleInputDataset(Dataset):
@@ -105,11 +153,16 @@ def build_feature_groups(features_df):
     Build feature groups (tokens) from a DataFrame.
     Group heuristics: LV*, RV*, EF*, MYO*, axis/ratio, and remaining numeric columns.
     """
+    if features_df is None or features_df.empty:
+        raise ValueError("features_df is empty; cannot build feature groups.")
+
     numeric_cols = [
         c for c in features_df.columns
         if c not in {"patient_id", "label", "label_enc"} and
         pd.api.types.is_numeric_dtype(features_df[c])
     ]
+    if not numeric_cols:
+        raise ValueError("No numeric feature columns found to build feature groups.")
     remaining = set(numeric_cols)
     groups = {}
 
@@ -127,14 +180,15 @@ def build_feature_groups(features_df):
     if remaining:
         groups["other"] = sorted(remaining)
     if not groups:
-        raise ValueError("No numeric feature groups found for tabular transformer.")
+        raise ValueError("No numeric feature groups found for tokenization.")
     return groups
 
 
 class TokenizedFeatureDataset(Dataset):
     """
-    Dataset that packs feature groups into fixed-length tokens for the tabular Transformer.
+    Dataset that packs feature groups into fixed-length tokens for transformer/GAT models.
     """
+
     def __init__(self, features_df, group_map, stats=None, fit_stats=False):
         self.group_map = group_map
         self.group_order = list(group_map.keys())
@@ -148,9 +202,7 @@ class TokenizedFeatureDataset(Dataset):
         }
 
         if fit_stats or stats is None:
-            self.stats = {
-                name: self._compute_stats(arr) for name, arr in self._raw.items()
-            }
+            self.stats = {name: self._compute_stats(arr) for name, arr in self._raw.items()}
         else:
             self.stats = stats
 
@@ -207,9 +259,15 @@ def train_epoch(model, loader, criterion, optimizer, device, model_type):
             geo = batch['geometric'].to(device)
             func = batch['functional'].to(device)
             logits = model(geo, func)
-        else:  # tabular_transformer
+        elif model_type == 'tabular_transformer':
             tokens = batch['tokens'].to(device)
             logits = model(tokens)
+        elif model_type == 'graph':
+            tokens = batch['tokens'].to(device)  # (B, T, D)
+            flat = tokens.view(tokens.size(0), -1)  # (B, T*D)
+            logits = model(flat)
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
         
         # Backward pass
         optimizer.zero_grad()
@@ -248,9 +306,15 @@ def eval_epoch(model, loader, criterion, device, num_classes, model_type):
             geo = batch['geometric'].to(device)
             func = batch['functional'].to(device)
             logits = model(geo, func)
-        else:  # tabular_transformer
+        elif model_type == 'tabular_transformer':
             tokens = batch['tokens'].to(device)
             logits = model(tokens)
+        elif model_type == 'graph':
+            tokens = batch['tokens'].to(device)
+            flat = tokens.view(tokens.size(0), -1)
+            logits = model(flat)
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
         
         loss = criterion(logits, labels)
         
@@ -303,41 +367,9 @@ def compute_ci95(arr):
     return float(ci[0]), float(ci[1])
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Train Advanced Attention Classifiers")
-    
-    # Data arguments
-    parser.add_argument("--features", default="meta/acdc_features.csv", help="Path to features CSV")
-    parser.add_argument("--folds", type=int, default=5, help="Number of CV folds")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    
-    # Model arguments
-    parser.add_argument("--model-type", type=str, default="advanced", 
-                        choices=["advanced", "multimodal", "tabular_transformer"],
-                        help="Model architecture: 'advanced' (single input), 'multimodal' (geo+func), or 'tabular_transformer' (grouped tokens)")
-    parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden dimension")
-    parser.add_argument("--num-blocks", type=int, default=4, help="Number of attention blocks")
-    parser.add_argument("--num-heads", type=int, default=8, help="Number of attention heads")
-    parser.add_argument("--mlp-ratio", type=float, default=4.0, help="MLP expansion ratio")
-    parser.add_argument("--dropout", type=float, default=0.3, help="Dropout rate")
-    parser.add_argument("--tt-d-model", type=int, default=256, help="Transformer width for tabular model")
-    parser.add_argument("--tt-depth", type=int, default=4, help="Transformer layers for tabular model")
-    parser.add_argument("--tt-heads", type=int, default=8, help="Attention heads for tabular model")
-    parser.add_argument("--tt-dropout", type=float, default=0.3, help="Dropout for tabular model")
-    
-    # Training arguments
-    parser.add_argument("--epochs", type=int, default=150, help="Number of epochs")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay (L2 regularization)")
-    parser.add_argument("--patience", type=int, default=30, help="Early stopping patience")
-    
-    # System arguments
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--logdir", default="logs", help="Output directory")
-    parser.add_argument("--verbose", action="store_true", help="Print detailed training progress")
-    
-    args = parser.parse_args()
+def main(argv=None):
+    parser = build_argparser()
+    args = parser.parse_args(argv)
     
     # Set random seeds
     torch.manual_seed(args.seed)
@@ -403,7 +435,7 @@ def main():
         print(f"Functional features ({len(ef_cols)}): {ef_cols}")
     else:
         group_map = build_feature_groups(df)
-        print(f"Tabular Transformer groups ({sum(len(v) for v in group_map.values())} features total):")
+        print(f"Grouped tokens ({sum(len(v) for v in group_map.values())} features total):")
         for name, cols in group_map.items():
             print(f"  - {name}: {cols}")
     
@@ -466,7 +498,7 @@ def main():
                 num_heads=args.num_heads,
                 dropout=args.dropout
             ).to(args.device)
-        else:  # tabular_transformer
+        elif args.model_type == 'tabular_transformer':
             train_dataset = TokenizedFeatureDataset(train_df, group_map, fit_stats=True)
             stats = train_dataset.get_stats()
             val_dataset = TokenizedFeatureDataset(val_df, group_map, stats=stats)
@@ -479,6 +511,21 @@ def main():
                 nhead=args.tt_heads,
                 depth=args.tt_depth,
                 dropout=args.tt_dropout
+            ).to(args.device)
+        else:  # graph
+            train_dataset = TokenizedFeatureDataset(train_df, group_map, fit_stats=True)
+            stats = train_dataset.get_stats()
+            val_dataset = TokenizedFeatureDataset(val_df, group_map, stats=stats)
+            scaler = stats
+            # Flatten tokens to a single vector per sample for the baseline GraphClassifier
+            # We will wrap the DataLoader to reshape tokens before model forward.
+            model = GraphClassifier(
+                input_features=train_dataset.max_dim * len(train_dataset.group_order),
+                num_classes=num_classes,
+                graph_hidden=args.graph_hidden,
+                graph_heads=args.graph_heads,
+                graph_layers=args.graph_layers,
+                graph_dropout=args.graph_dropout
             ).to(args.device)
         
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)

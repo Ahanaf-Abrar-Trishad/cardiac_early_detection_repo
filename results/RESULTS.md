@@ -396,7 +396,7 @@
 ---
 
 **Generated**: November 5, 2025  
-**Pipeline**: `./run_full_pipeline.sh`  
+**Pipeline**: `make seg3d-ed seg3d-es oof-all features-geom diag-geom`  
 **Documentation**: See `PIPELINE.md` for full reproduction instructions
 
 
@@ -424,4 +424,3 @@
 - **Gated Fusion**: Learned gating mechanism for multi-modal feature weighting
 
 - **Cross-Modal Attention**: Query-key-value attention for feature fusion
-

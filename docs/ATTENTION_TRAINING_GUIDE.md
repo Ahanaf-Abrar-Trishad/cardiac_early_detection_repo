@@ -2,7 +2,7 @@
 
 ## 🎯 What We Have
 
-Two state-of-the-art attention-based architectures for cardiac disease classification:
+Four attention-based architectures for cardiac disease classification:
 
 1. **AdvancedAttentionClassifier** (3.2M parameters)
    - Single-input with multi-head self-attention
@@ -15,10 +15,24 @@ Two state-of-the-art attention-based architectures for cardiac disease classific
    - Cross-modal attention between feature types
    - Bidirectional feature interaction
 
+3. **TabularTransformerClassifier** (configurable width/heads/depth)
+   - Groups related features into tokens (LV, RV, MYO, EF, shape/other)
+   - Adds a learned phase token + positional/type embeddings
+   - Transformer encoder with attention pooling
+
+4. **GraphClassifier (GAT)** (configurable hidden/heads/layers)
+   - Builds a small physiological graph over grouped tokens
+   - Stacked graph attention layers + attention pooling
+   - Good for enforcing relational structure among ED/ES metrics
+
+Baselines already available for comparison:
+- Traditional ML: Logistic Regression, Random Forest, XGBoost
+- RAP Fusion: lightweight attention baseline with strong accuracy
+
 ## 🚀 Quick Start - Train Both Models
 
 ```bash
-# Train both models with default parameters
+# Train all attention models (advanced, multimodal, tabular transformer, graph)
 ./run_attention_training.sh
 
 # This will:
@@ -36,6 +50,12 @@ Two state-of-the-art attention-based architectures for cardiac disease classific
 
 # Train only MultiModalAttentionClassifier
 ./run_attention_training.sh --model multimodal
+
+# Train only TabularTransformerClassifier
+./run_attention_training.sh --model tabular_transformer --tt-d-model 320 --tt-depth 6 --tt-heads 8 --tt-dropout 0.3
+
+# Train only GraphClassifier (GAT over tokens)
+./run_attention_training.sh --model graph --graph-hidden 128 --graph-heads 4 --graph-layers 2 --graph-dropout 0.2
 ```
 
 ## ⚙️ Custom Training Parameters
@@ -104,6 +124,20 @@ python scripts/train_attention_classifier.py \
     --hidden-dim 256 \
     --num-heads 8 \
     --dropout 0.3 \
+    --verbose
+
+# Train Tabular Transformer (grouped tokens)
+python scripts/train_attention_classifier.py \
+    --model-type tabular_transformer \
+    --features meta/acdc_features.csv \
+    --folds 5 \
+    --epochs 150 \
+    --batch-size 32 \
+    --lr 1e-4 \
+    --tt-d-model 320 \
+    --tt-depth 6 \
+    --tt-heads 8 \
+    --tt-dropout 0.3 \
     --verbose
 ```
 

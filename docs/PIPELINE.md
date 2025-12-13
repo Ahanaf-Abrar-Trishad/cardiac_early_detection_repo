@@ -2,24 +2,22 @@
 
 ## 🚀 Quick Start
 
-### Option 1: Run Complete Pipeline (All Steps)
+### One-shot via Makefile
 ```bash
-./run_full_pipeline.sh
+make seg3d-ed       # ACDC ED segmentation CV
+make seg3d-es       # ACDC ES segmentation CV
+make oof-all        # OOF inference for ED+ES
+make features-geom  # Robust + geometric features
+make diag-geom      # Diagnosis baseline (geom)
 ```
 
-### Option 2: Run From Specific Point (Skip Completed Steps)
+### Skip to a specific step
 ```bash
-# Skip segmentation (if already trained)
-./run_full_pipeline.sh --skip-seg
+# Already have segmentation? build features + diagnosis only
+make features-geom diag-geom
 
-# Skip segmentation + OOF inference
-./run_full_pipeline.sh --skip-seg --skip-oof
-
-# Skip everything except results generation
-./run_full_pipeline.sh --skip-seg --skip-oof --skip-features --skip-fusion --skip-baselines
-
-# Show all options
-./run_full_pipeline.sh --help
+# Only re-run diagnosis with existing features
+make diag-geom
 ```
 
 ---
@@ -275,12 +273,12 @@ python scripts/make_results_md.py
 
 1. **Missing checkpoints**: Run segmentation training first
    ```bash
-   ./run_full_pipeline.sh
+   make seg3d-ed seg3d-es
    ```
 
 2. **Missing features**: Run feature extraction
    ```bash
-   ./run_feature_extraction.sh
+   make features-geom
    ```
 
 3. **OOF predictions not found**: Make sure to use `--with-bg` flag
@@ -321,19 +319,19 @@ python scripts/make_results_md.py
 ### For First-Time Users
 ```bash
 # Complete pipeline from scratch
-./run_full_pipeline.sh
+make seg3d-ed seg3d-es oof-all features-geom diag-geom
 ```
 
 ### For Iterative Development
 ```bash
 # Train only segmentation
-./run_full_pipeline.sh --skip-fusion --skip-baselines
+make seg3d-ed seg3d-es
 
 # Train only classification
-./run_full_pipeline.sh --skip-seg --skip-oof --skip-features
+python scripts/train_fusion_classifier.py --features meta/acdc_features.csv --fusion-type rap --use-cross-attention
 
 # Update results only
-./run_full_pipeline.sh --skip-seg --skip-oof --skip-features --skip-fusion --skip-baselines
+make results-md
 ```
 
 ### For Experimentation
@@ -361,10 +359,16 @@ python scripts/classify_cv.py --model xgb ...
 
 ---
 
+## 📊 Segmentation Outputs & Reporting
+
+- Per-fold metrics: `logs/cv_seg_{dataset}_metrics.csv` with Dice/IoU/Accuracy/F1 and optional per-class ACDC columns.
+- Summary stats: `logs/cv_seg_{dataset}_summary.json` (mean/std plus 95% CI from the CV folds).
+- Per-class ACDC breakdown: `logs/cv_seg_acdc_multiclass_perclass.csv` when multiclass.
+- Artifacts: best checkpoints `logs/seg_*_best.pt` and validation overlays in `logs/runs/*`.
+
 ## 📚 Additional Resources
 
 - `QUICK_START.md` - Quick setup guide
 - `REPRODUCIBILITY.md` - Reproduction instructions
-- `IMPLEMENTATION_SUMMARY.md` - Technical details
-- `OUTPUT_SUMMARY.md` - Output format documentation
-- `RESULTS.md` - Latest results (auto-generated)
+- `ATTENTION_TRAINING_GUIDE.md` - Attention model commands
+- `RESULTS.md` - Output format and latest metrics
