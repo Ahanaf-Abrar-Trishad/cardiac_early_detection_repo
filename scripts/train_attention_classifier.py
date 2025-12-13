@@ -32,6 +32,7 @@ from models.advanced_attention_classifier import (
     AdvancedAttentionClassifier,
     MultiModalAttentionClassifier
 )
+from models.tabular_transformer import TabularTransformerClassifier
 
 
 class SingleInputDataset(Dataset):
@@ -99,6 +100,96 @@ class MultiModalDataset(Dataset):
         return {'geo': self.scaler_geo, 'func': self.scaler_func}
 
 
+def build_feature_groups(features_df):
+    """
+    Build feature groups (tokens) from a DataFrame.
+    Group heuristics: LV*, RV*, EF*, MYO*, axis/ratio, and remaining numeric columns.
+    """
+    numeric_cols = [
+        c for c in features_df.columns
+        if c not in {"patient_id", "label", "label_enc"} and
+        pd.api.types.is_numeric_dtype(features_df[c])
+    ]
+    remaining = set(numeric_cols)
+    groups = {}
+
+    def take(name, predicate):
+        cols = sorted([c for c in list(remaining) if predicate(c)])
+        if cols:
+            groups[name] = cols
+            remaining.difference_update(cols)
+
+    take("lv", lambda c: c.upper().startswith("LV"))
+    take("rv", lambda c: c.upper().startswith("RV"))
+    take("ef", lambda c: "EF" in c.upper())
+    take("myo", lambda c: c.upper().startswith("MYO"))
+    take("shape", lambda c: ("axis" in c.lower()) or ("ratio" in c.lower()))
+    if remaining:
+        groups["other"] = sorted(remaining)
+    if not groups:
+        raise ValueError("No numeric feature groups found for tabular transformer.")
+    return groups
+
+
+class TokenizedFeatureDataset(Dataset):
+    """
+    Dataset that packs feature groups into fixed-length tokens for the tabular Transformer.
+    """
+    def __init__(self, features_df, group_map, stats=None, fit_stats=False):
+        self.group_map = group_map
+        self.group_order = list(group_map.keys())
+        self.max_dim = max(len(cols) for cols in group_map.values())
+        self.labels = features_df["label_enc"].values
+
+        # Prepare feature arrays
+        self._raw = {
+            name: features_df[cols].to_numpy(dtype=np.float32)
+            for name, cols in group_map.items()
+        }
+
+        if fit_stats or stats is None:
+            self.stats = {
+                name: self._compute_stats(arr) for name, arr in self._raw.items()
+            }
+        else:
+            self.stats = stats
+
+        self.features = {
+            name: self._standardize(self._raw[name], self.stats[name])
+            for name in self.group_order
+        }
+
+    @staticmethod
+    def _compute_stats(arr):
+        mean = np.nanmean(arr, axis=0)
+        std = np.nanstd(arr, axis=0)
+        mean = np.where(np.isnan(mean), 0.0, mean)
+        std = np.where(std < 1e-6, 1.0, std)
+        std = np.where(np.isnan(std), 1.0, std)
+        return mean.astype(np.float32), std.astype(np.float32)
+
+    @staticmethod
+    def _standardize(arr, stats):
+        mean, std = stats
+        arr = np.where(np.isnan(arr), mean, arr)
+        return (arr - mean) / std
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        tokens = []
+        for name in self.group_order:
+            vec = self.features[name][idx]
+            pad = np.zeros(self.max_dim, dtype=np.float32)
+            pad[: vec.shape[0]] = vec
+            tokens.append(pad)
+        tokens = torch.from_numpy(np.stack(tokens, axis=0))
+        return {"tokens": tokens, "label": int(self.labels[idx])}
+
+    def get_stats(self):
+        return self.stats
+
 def train_epoch(model, loader, criterion, optimizer, device, model_type):
     """Train for one epoch."""
     model.train()
@@ -112,10 +203,13 @@ def train_epoch(model, loader, criterion, optimizer, device, model_type):
         if model_type == 'advanced':
             features = batch['features'].to(device)
             logits = model(features)
-        else:  # multimodal
+        elif model_type == 'multimodal':
             geo = batch['geometric'].to(device)
             func = batch['functional'].to(device)
             logits = model(geo, func)
+        else:  # tabular_transformer
+            tokens = batch['tokens'].to(device)
+            logits = model(tokens)
         
         # Backward pass
         optimizer.zero_grad()
@@ -150,10 +244,13 @@ def eval_epoch(model, loader, criterion, device, num_classes, model_type):
         if model_type == 'advanced':
             features = batch['features'].to(device)
             logits = model(features)
-        else:  # multimodal
+        elif model_type == 'multimodal':
             geo = batch['geometric'].to(device)
             func = batch['functional'].to(device)
             logits = model(geo, func)
+        else:  # tabular_transformer
+            tokens = batch['tokens'].to(device)
+            logits = model(tokens)
         
         loss = criterion(logits, labels)
         
@@ -216,13 +313,17 @@ def main():
     
     # Model arguments
     parser.add_argument("--model-type", type=str, default="advanced", 
-                        choices=["advanced", "multimodal"],
-                        help="Model architecture: 'advanced' (single input) or 'multimodal' (geo+func)")
+                        choices=["advanced", "multimodal", "tabular_transformer"],
+                        help="Model architecture: 'advanced' (single input), 'multimodal' (geo+func), or 'tabular_transformer' (grouped tokens)")
     parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden dimension")
     parser.add_argument("--num-blocks", type=int, default=4, help="Number of attention blocks")
     parser.add_argument("--num-heads", type=int, default=8, help="Number of attention heads")
     parser.add_argument("--mlp-ratio", type=float, default=4.0, help="MLP expansion ratio")
     parser.add_argument("--dropout", type=float, default=0.3, help="Dropout rate")
+    parser.add_argument("--tt-d-model", type=int, default=256, help="Transformer width for tabular model")
+    parser.add_argument("--tt-depth", type=int, default=4, help="Transformer layers for tabular model")
+    parser.add_argument("--tt-heads", type=int, default=8, help="Attention heads for tabular model")
+    parser.add_argument("--tt-dropout", type=float, default=0.3, help="Dropout for tabular model")
     
     # Training arguments
     parser.add_argument("--epochs", type=int, default=150, help="Number of epochs")
@@ -255,6 +356,36 @@ def main():
     
     # Load features
     df = pd.read_csv(args.features)
+
+    # If label column is missing, try merging from a labels CSV
+    if "label" not in df.columns:
+        default_labels_path = Path("results") / "acdc_labels.csv"
+        labels_path = default_labels_path if default_labels_path.exists() else None
+        # Allow override via --labels argument if added; fallback to default path
+        # Backward-compatible: infer labels if available
+        try:
+            # Try to find labels file near features
+            if labels_path is None:
+                candidate = Path(args.features).with_name("acdc_labels.csv")
+                if candidate.exists():
+                    labels_path = candidate
+            if labels_path is not None:
+                labels_df = pd.read_csv(labels_path)
+                # Expect columns: patient_id, diagnosis
+                if "patient_id" in df.columns and {"patient_id","diagnosis"}.issubset(labels_df.columns):
+                    df = df.merge(labels_df[["patient_id","diagnosis"]], on="patient_id", how="left")
+                    df = df.rename(columns={"diagnosis":"label"})
+                else:
+                    print("Warning: Could not merge labels; expected columns 'patient_id' and 'diagnosis'.")
+            else:
+                print("Warning: 'label' column not found and no labels CSV detected.")
+        except Exception as e:
+            print(f"Warning: Failed to merge labels automatically: {e}")
+
+    # Final check for labels
+    if "label" not in df.columns:
+        raise KeyError("'label' column missing. Provide a labels CSV (results/acdc_labels.csv) with columns ['patient_id','diagnosis'] or include 'label' in features CSV.")
+
     df = df.dropna(subset=["label"]).reset_index(drop=True)
     
     print(f"\nDataset: {len(df)} patients")
@@ -264,11 +395,17 @@ def main():
     geo_cols = [c for c in df.columns if c.endswith('_mL') or c.endswith('_mm')]
     all_feat_cols = geo_cols + ef_cols
     
+    group_map = None
     if args.model_type == 'advanced':
         print(f"Features ({len(all_feat_cols)}): {all_feat_cols}")
-    else:
+    elif args.model_type == 'multimodal':
         print(f"Geometric features ({len(geo_cols)}): {geo_cols}")
         print(f"Functional features ({len(ef_cols)}): {ef_cols}")
+    else:
+        group_map = build_feature_groups(df)
+        print(f"Tabular Transformer groups ({sum(len(v) for v in group_map.values())} features total):")
+        for name, cols in group_map.items():
+            print(f"  - {name}: {cols}")
     
     # Encode labels
     le = LabelEncoder()
@@ -308,16 +445,6 @@ def main():
             train_dataset = SingleInputDataset(train_df, all_feat_cols, fit_scaler=True)
             scaler = train_dataset.get_scaler()
             val_dataset = SingleInputDataset(val_df, all_feat_cols, scaler=scaler)
-        else:  # multimodal
-            train_dataset = MultiModalDataset(train_df, geo_cols, ef_cols, fit_scaler=True)
-            scaler = train_dataset.get_scalers()
-            val_dataset = MultiModalDataset(val_df, geo_cols, ef_cols, scaler=scaler)
-        
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-        
-        # Create model
-        if args.model_type == 'advanced':
             model = AdvancedAttentionClassifier(
                 input_features=len(all_feat_cols),
                 num_classes=num_classes,
@@ -327,7 +454,10 @@ def main():
                 mlp_ratio=args.mlp_ratio,
                 dropout=args.dropout
             ).to(args.device)
-        else:  # multimodal
+        elif args.model_type == 'multimodal':
+            train_dataset = MultiModalDataset(train_df, geo_cols, ef_cols, fit_scaler=True)
+            scaler = train_dataset.get_scalers()
+            val_dataset = MultiModalDataset(val_df, geo_cols, ef_cols, scaler=scaler)
             model = MultiModalAttentionClassifier(
                 num_geometric=len(geo_cols),
                 num_functional=len(ef_cols),
@@ -336,6 +466,23 @@ def main():
                 num_heads=args.num_heads,
                 dropout=args.dropout
             ).to(args.device)
+        else:  # tabular_transformer
+            train_dataset = TokenizedFeatureDataset(train_df, group_map, fit_stats=True)
+            stats = train_dataset.get_stats()
+            val_dataset = TokenizedFeatureDataset(val_df, group_map, stats=stats)
+            scaler = stats  # keep naming consistent in checkpoint
+            model = TabularTransformerClassifier(
+                token_dim=train_dataset.max_dim,
+                num_tokens=len(train_dataset.group_order),
+                num_classes=num_classes,
+                d_model=args.tt_d_model,
+                nhead=args.tt_heads,
+                depth=args.tt_depth,
+                dropout=args.tt_dropout
+            ).to(args.device)
+        
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
         
         # Count parameters
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
