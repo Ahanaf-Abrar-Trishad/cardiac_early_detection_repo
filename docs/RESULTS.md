@@ -23,6 +23,17 @@
 
 Confusion matrix: `results/acdc_diag_cm_geom.csv`
 
+### Attention-based models (latest runs, 5-fold CV)
+
+| model                 | acc    | bal_acc | f1_macro | f1_weighted | auc   |
+|-----------------------|-------:|--------:|---------:|------------:|------:|
+| advanced              | 0.947  | 0.947   | 0.9463   | 0.9463      | 0.9908 |
+| tabular_transformer   | 0.947  | 0.947   | 0.9457   | 0.9457      | 0.9911 |
+| multimodal            | 0.920  | 0.920   | 0.9188   | 0.9188      | 0.9881 |
+| graph (GAT)           | 0.787  | 0.787   | 0.7393   | 0.7393      | 0.9692 |
+
+Source: `logs/attention_{model}_cv_summary.json`
+
 ## Classification (To Run / Compare)
 
 The repository includes four attention-based classifiers:
