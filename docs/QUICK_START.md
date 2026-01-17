@@ -102,7 +102,6 @@ cardiac_early_detection_repo/
 │   ├── seg_cv.py             # Segmentation training (UPDATED)
 │   ├── train_fusion_cv.py    # Fusion classifier training (NEW)
 │   └── make_results_summary.py # Results aggregation (UPDATED)
-├── IMPLEMENTATION_SUMMARY.md # Detailed implementation notes
 └── QUICK_START.md            # This file
 ```
 
@@ -163,7 +162,7 @@ pip install einops
 ## 📞 Support
 
 Check these files for more details:
-- `IMPLEMENTATION_SUMMARY.md` - Technical details
+- `PIPELINE.md` - End-to-end walkthrough and outputs
 - `scripts/seg_cv.py --help` - All segmentation options
 - `scripts/train_fusion_cv.py --help` - All classifier options
 
