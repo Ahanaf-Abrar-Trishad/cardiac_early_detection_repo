@@ -102,21 +102,28 @@ oof-all: ## ED + ES
 	$(MAKE) oof-es
 
 # ===== Features from OOF (robust + geometric) =====
-.PHONY: features-geom labels
+.PHONY: features-geom features-camus labels
 features-geom: ## Build robust volumes/EF + geometry to results/acdc_oof_features_geom.csv
 	$(PYTHON) scripts/build_features_geom.py
+features-camus: ## Extract CAMUS echocardiographic features to meta/camus_features.csv
+	$(PYTHON) scripts/extract_features_camus.py
 labels: ## Export labels (patient_id, diagnosis) to results/acdc_labels.csv
 	$(PYTHON) scripts/extract_acdc_labels.py
 
 # ===== Diagnosis CV (tabular) =====
-.PHONY: diag-geom
+.PHONY: diag-geom diag-cross-modal
 diag-geom: ## HGB on robust+geom features (5x GroupKFold)
 	$(PYTHON) scripts/train_diag_geom.py
+diag-cross-modal: ## Cross-modal attention fusion (MRI + Echo) CV
+	export PYTHONPATH=$(PYTHONPATH); \
+	$(PYTHON) scripts/train_cross_modal_fusion.py
 
 # ===== Results summary =====
-.PHONY: results-md
+.PHONY: results-md cross-modal-summary
 results-md: ## Generate RESULTS.md summary
 	$(PYTHON) scripts/make_results_md.py
+cross-modal-summary: ## Show cross-modal attention fusion implementation summary
+	$(PYTHON) cross_modal_summary.py
 
 # ===== QA & Dev =====
 .PHONY: fmt lint test qa
@@ -137,7 +144,8 @@ reports: ## Run notebooks manually (open in Jupyter) and write to reports/ & rep
 	@echo "Open notebooks/cardiac_cls_report.ipynb and notebooks/cardiac_seg_report.ipynb and Run All."
 
 # ===== Convenience =====
-.PHONY: all clean
-all: camus acdc splits seg2d seg3d-ed oof-all features-geom labels diag-geom results-md ## End-to-end (heavy)
+.PHONY: all cross-modal-workflow clean
+all: camus acdc splits seg2d seg3d-ed oof-all features-geom features-camus labels diag-geom diag-cross-modal results-md ## End-to-end (heavy)
+cross-modal-workflow: features-camus diag-cross-modal cross-modal-summary ## Cross-modal fusion workflow (CAMUS features + training + summary)
 clean: ## Remove logs and reports
 	rm -rf logs logs_ef logs_vol reports reports_seg
