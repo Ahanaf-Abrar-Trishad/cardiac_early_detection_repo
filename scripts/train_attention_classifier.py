@@ -264,8 +264,7 @@ def train_epoch(model, loader, criterion, optimizer, device, model_type):
             logits = model(tokens)
         elif model_type == 'graph':
             tokens = batch['tokens'].to(device)  # (B, T, D)
-            flat = tokens.view(tokens.size(0), -1)  # (B, T*D)
-            logits = model(flat)
+            logits = model(tokens)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
         
@@ -311,8 +310,7 @@ def eval_epoch(model, loader, criterion, device, num_classes, model_type):
             logits = model(tokens)
         elif model_type == 'graph':
             tokens = batch['tokens'].to(device)
-            flat = tokens.view(tokens.size(0), -1)
-            logits = model(flat)
+            logits = model(tokens)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
         
@@ -520,12 +518,13 @@ def main(argv=None):
             # Flatten tokens to a single vector per sample for the baseline GraphClassifier
             # We will wrap the DataLoader to reshape tokens before model forward.
             model = GraphClassifier(
-                input_features=train_dataset.max_dim * len(train_dataset.group_order),
+                token_dim=train_dataset.max_dim,
+                num_tokens=len(train_dataset.group_order),
                 num_classes=num_classes,
-                graph_hidden=args.graph_hidden,
-                graph_heads=args.graph_heads,
-                graph_layers=args.graph_layers,
-                graph_dropout=args.graph_dropout
+                hidden_dim=args.graph_hidden,
+                heads=args.graph_heads,
+                layers=args.graph_layers,
+                dropout=args.graph_dropout
             ).to(args.device)
         
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
