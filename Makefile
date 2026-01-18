@@ -39,6 +39,18 @@ CKPT_PATTERN   ?= logs/seg_acdc_fold{fold}_best.pt
 OOF_DIR        ?= logs/oof_preds/acdc
 PERCLASS_CSV   ?= results/acdc_per_class_dice.csv
 
+# Attention classifier defaults
+ATTN_MODEL     ?= tabular_transformer
+ATTN_FOLDS     ?= 5
+ATTN_EPOCHS    ?= 100
+ATTN_BATCH     ?= 16
+ATTN_LR        ?= 5e-4
+ATTN_HIDDEN    ?= 256
+ATTN_TT_D_MODEL ?= 128
+ATTN_TT_HEADS  ?= 8
+ATTN_TT_DEPTH  ?= 4
+ATTN_SEED      ?= 42
+
 # ===== Helpers =====
 .PHONY: help
 help: ## Show this help
@@ -111,9 +123,14 @@ labels: ## Export labels (patient_id, diagnosis) to results/acdc_labels.csv
 	$(PYTHON) scripts/extract_acdc_labels.py
 
 # ===== Diagnosis CV (tabular) =====
-.PHONY: diag-geom diag-cross-modal
+.PHONY: diag-geom diag-attention diag-cross-modal
 diag-geom: ## HGB on robust+geom features (5x GroupKFold)
 	$(PYTHON) scripts/train_diag_geom.py
+diag-attention: ## Attention-based classification with SMOTE and geometric features
+	export PYTHONPATH=$(PYTHONPATH); \
+	$(PYTHON) scripts/train_attention_classifier.py --features results/acdc_oof_features_geom.csv \
+	  --model-type $(ATTN_MODEL) --folds $(ATTN_FOLDS) --epochs $(ATTN_EPOCHS) --batch-size $(ATTN_BATCH) --lr $(ATTN_LR) \
+	  --hidden-dim $(ATTN_HIDDEN) --tt-d-model $(ATTN_TT_D_MODEL) --tt-heads $(ATTN_TT_HEADS) --tt-depth $(ATTN_TT_DEPTH) --seed $(ATTN_SEED)
 diag-cross-modal: ## Cross-modal attention fusion (MRI + Echo) CV
 	export PYTHONPATH=$(PYTHONPATH); \
 	$(PYTHON) scripts/train_cross_modal_fusion.py
@@ -144,8 +161,9 @@ reports: ## Run notebooks manually (open in Jupyter) and write to reports/ & rep
 	@echo "Open notebooks/cardiac_cls_report.ipynb and notebooks/cardiac_seg_report.ipynb and Run All."
 
 # ===== Convenience =====
-.PHONY: all cross-modal-workflow clean
-all: camus acdc splits seg2d seg3d-ed oof-all features-geom features-camus labels diag-geom diag-cross-modal results-md ## End-to-end (heavy)
+.PHONY: all attention-workflow cross-modal-workflow clean
+all: camus acdc splits seg2d seg3d-ed oof-all features-geom features-camus labels diag-geom diag-attention diag-cross-modal results-md ## End-to-end (heavy)
+attention-workflow: features-geom diag-attention results-md ## Attention-based classification workflow (geometric features + training + summary)
 cross-modal-workflow: features-camus diag-cross-modal cross-modal-summary ## Cross-modal fusion workflow (CAMUS features + training + summary)
 clean: ## Remove logs and reports
 	rm -rf logs logs_ef logs_vol reports reports_seg
