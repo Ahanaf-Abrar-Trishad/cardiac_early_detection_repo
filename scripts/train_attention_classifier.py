@@ -25,6 +25,9 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score, classification_report
 from torch.utils.data import Dataset, DataLoader
 from scipy import stats
+from sklearn.impute import SimpleImputer
+from imblearn.over_sampling import SMOTE
+from collections import Counter
 
 import sys
 
@@ -148,10 +151,11 @@ class MultiModalDataset(Dataset):
         return {'geo': self.scaler_geo, 'func': self.scaler_func}
 
 
-def build_feature_groups(features_df):
+def build_feature_groups(features_df, valid_features=None):
     """
     Build feature groups (tokens) from a DataFrame.
     Group heuristics: LV*, RV*, EF*, MYO*, axis/ratio, and remaining numeric columns.
+    If valid_features is provided, only use those features.
     """
     if features_df is None or features_df.empty:
         raise ValueError("features_df is empty; cannot build feature groups.")
@@ -161,6 +165,9 @@ def build_feature_groups(features_df):
         if c not in {"patient_id", "label", "label_enc"} and
         pd.api.types.is_numeric_dtype(features_df[c])
     ]
+    if valid_features:
+        numeric_cols = [c for c in numeric_cols if c in valid_features]
+    
     if not numeric_cols:
         raise ValueError("No numeric feature columns found to build feature groups.")
     remaining = set(numeric_cols)
@@ -420,9 +427,9 @@ def main(argv=None):
     
     print(f"\nDataset: {len(df)} patients")
     
-    # Define feature groups
-    ef_cols = [c for c in df.columns if 'EF' in c]
-    geo_cols = [c for c in df.columns if c.endswith('_mL') or c.endswith('_mm')]
+    # Define feature groups - filter out features with too many NaNs
+    ef_cols = [c for c in df.columns if 'EF' in c and df[c].notna().sum() > len(df) * 0.3]  # At least 30% non-NaN
+    geo_cols = [c for c in df.columns if (c.endswith('_ml') or c.endswith('_mL') or c.endswith('_mm') or 'axis' in c or 'ratio' in c) and df[c].notna().sum() > len(df) * 0.3]
     all_feat_cols = geo_cols + ef_cols
     
     group_map = None
@@ -432,10 +439,8 @@ def main(argv=None):
         print(f"Geometric features ({len(geo_cols)}): {geo_cols}")
         print(f"Functional features ({len(ef_cols)}): {ef_cols}")
     else:
-        group_map = build_feature_groups(df)
-        print(f"Grouped tokens ({sum(len(v) for v in group_map.values())} features total):")
-        for name, cols in group_map.items():
-            print(f"  - {name}: {cols}")
+        # group_map will be built per fold from valid features
+        pass
     
     # Encode labels
     le = LabelEncoder()
@@ -468,11 +473,44 @@ def main(argv=None):
         train_df = df.iloc[train_idx].reset_index(drop=True)
         val_df = df.iloc[val_idx].reset_index(drop=True)
         
-        print(f"Train: {len(train_df)} patients | Val: {len(val_df)} patients")
+        # Apply SMOTE for class balancing on training data
+        print(f"Original training class distribution: {Counter(train_df['label_enc'])}")
+        
+        # Prepare features for SMOTE (use only valid features)
+        valid_feat_cols = [col for col in all_feat_cols if col in train_df.columns and train_df[col].notna().any()]
+        print(f"Using {len(valid_feat_cols)} valid features for SMOTE: {valid_feat_cols}")
+        
+        # Build group_map from valid features only
+        if args.model_type in ['tabular_transformer', 'graph']:
+            group_map = build_feature_groups(train_df, valid_features=valid_feat_cols)
+            print(f"Grouped tokens ({sum(len(v) for v in group_map.values())} features total):")
+            for name, cols in group_map.items():
+                print(f"  - {name}: {cols}")
+        
+        X_train = train_df[valid_feat_cols].values
+        y_train = train_df['label_enc'].values
+        
+        # Handle missing values with imputation
+        imputer = SimpleImputer(strategy='median')
+        X_train_imputed = imputer.fit_transform(X_train)
+        
+        # Apply SMOTE
+        min_samples = min(Counter(y_train).values())
+        k_neighbors = min(5, max(1, min_samples - 1))
+        smote = SMOTE(random_state=args.seed, k_neighbors=k_neighbors)
+        X_train_balanced, y_train_balanced = smote.fit_resample(X_train_imputed, y_train)
+        
+        # Create balanced training dataframe
+        train_df_balanced = pd.DataFrame(X_train_balanced, columns=valid_feat_cols)
+        train_df_balanced['label_enc'] = y_train_balanced
+        train_df_balanced['patient_id'] = [f"smote_{i}" for i in range(len(train_df_balanced))]
+        
+        print(f"Balanced training class distribution: {Counter(y_train_balanced)}")
+        print(f"Train: {len(train_df_balanced)} patients (after SMOTE) | Val: {len(val_df)} patients")
         
         # Create datasets and loaders
         if args.model_type == 'advanced':
-            train_dataset = SingleInputDataset(train_df, all_feat_cols, fit_scaler=True)
+            train_dataset = SingleInputDataset(train_df_balanced, all_feat_cols, fit_scaler=True)
             scaler = train_dataset.get_scaler()
             val_dataset = SingleInputDataset(val_df, all_feat_cols, scaler=scaler)
             model = AdvancedAttentionClassifier(
@@ -485,7 +523,7 @@ def main(argv=None):
                 dropout=args.dropout
             ).to(args.device)
         elif args.model_type == 'multimodal':
-            train_dataset = MultiModalDataset(train_df, geo_cols, ef_cols, fit_scaler=True)
+            train_dataset = MultiModalDataset(train_df_balanced, geo_cols, ef_cols, fit_scaler=True)
             scaler = train_dataset.get_scalers()
             val_dataset = MultiModalDataset(val_df, geo_cols, ef_cols, scaler=scaler)
             model = MultiModalAttentionClassifier(
@@ -497,7 +535,7 @@ def main(argv=None):
                 dropout=args.dropout
             ).to(args.device)
         elif args.model_type == 'tabular_transformer':
-            train_dataset = TokenizedFeatureDataset(train_df, group_map, fit_stats=True)
+            train_dataset = TokenizedFeatureDataset(train_df_balanced, group_map, fit_stats=True)
             stats = train_dataset.get_stats()
             val_dataset = TokenizedFeatureDataset(val_df, group_map, stats=stats)
             scaler = stats  # keep naming consistent in checkpoint
@@ -511,7 +549,7 @@ def main(argv=None):
                 dropout=args.tt_dropout
             ).to(args.device)
         else:  # graph
-            train_dataset = TokenizedFeatureDataset(train_df, group_map, fit_stats=True)
+            train_dataset = TokenizedFeatureDataset(train_df_balanced, group_map, fit_stats=True)
             stats = train_dataset.get_stats()
             val_dataset = TokenizedFeatureDataset(val_df, group_map, stats=stats)
             scaler = stats
