@@ -11,9 +11,10 @@ __pycache__/
 *.pyd
 .Python
 
-# Model weights and checkpoints
-*.pt
-*.pth
+# Model weights — tracked in git (all files are under 100 MB)
+# *.pt intentionally not excluded
+
+# Large external model formats (still exclude)
 *.ckpt
 *.bin
 
@@ -24,11 +25,10 @@ __pycache__/
 *.mhd
 *.mha
 
-# Generated images and previews
+# Generated images and previews — exclude bulk preview directories
 logs/runs/
-*.png
-*.jpg
-*.jpeg
+# Keep thesis figures (confusion matrices, segmentation examples) trackable
+# by not globally excluding *.png — only exclude the bulk preview folder above
 
 # Backup files
 *.backup
