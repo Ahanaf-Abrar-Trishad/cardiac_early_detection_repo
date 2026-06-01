@@ -34,8 +34,8 @@ AUG3D_FLAGS    ?= --aug3d --p-flip 0.5 --p-rot 0.5 --rot-deg 12 \
                   --p-gamma 0.5 --gamma-min 0.9 --gamma-max 1.15 \
                   --p-bright 0.5 --bright-min 0.9 --bright-max 1.1
 
-# OOF / features
-CKPT_PATTERN   ?= logs/seg_acdc_fold{fold}_best.pt
+# OOF / features — phase-specific checkpoint names (ED and ES are separate models)
+CKPT_PATTERN   ?= logs/seg_acdc_$(PHASE)_fold{fold}_best.pt
 OOF_DIR        ?= logs/oof_preds/acdc
 PERCLASS_CSV   ?= results/acdc_per_class_dice.csv
 
@@ -126,11 +126,21 @@ labels: ## Export labels (patient_id, diagnosis) to results/acdc_labels.csv
 .PHONY: diag-geom diag-attention diag-cross-modal
 diag-geom: ## HGB on robust+geom features (5x GroupKFold)
 	$(PYTHON) scripts/train_diag_geom.py
-diag-attention: ## Attention-based classification with SMOTE and geometric features
+diag-attention: ## Attention-based classification (single model type, set ATTN_MODEL=advanced|multimodal|tabular_transformer|graph)
 	export PYTHONPATH=$(PYTHONPATH); \
 	$(PYTHON) scripts/train_attention_classifier.py --features results/acdc_oof_features_geom.csv \
 	  --model-type $(ATTN_MODEL) --folds $(ATTN_FOLDS) --epochs $(ATTN_EPOCHS) --batch-size $(ATTN_BATCH) --lr $(ATTN_LR) \
 	  --hidden-dim $(ATTN_HIDDEN) --tt-d-model $(ATTN_TT_D_MODEL) --tt-heads $(ATTN_TT_HEADS) --tt-depth $(ATTN_TT_DEPTH) --seed $(ATTN_SEED)
+
+diag-attention-all: ## Run all 4 attention model variants sequentially
+	export PYTHONPATH=$(PYTHONPATH); \
+	for model in advanced multimodal tabular_transformer graph; do \
+	  echo "=== Training $$model ==="; \
+	  $(PYTHON) scripts/train_attention_classifier.py --features results/acdc_oof_features_geom.csv \
+	    --model-type $$model --folds $(ATTN_FOLDS) --epochs $(ATTN_EPOCHS) --batch-size $(ATTN_BATCH) --lr $(ATTN_LR) \
+	    --hidden-dim $(ATTN_HIDDEN) --tt-d-model $(ATTN_TT_D_MODEL) --tt-heads $(ATTN_TT_HEADS) --tt-depth $(ATTN_TT_DEPTH) \
+	    --seed $(ATTN_SEED) --logdir logs/attn_$$model; \
+	done
 diag-cross-modal: ## Cross-modal attention fusion (MRI + Echo) CV
 	export PYTHONPATH=$(PYTHONPATH); \
 	$(PYTHON) scripts/train_cross_modal_fusion.py
@@ -162,7 +172,7 @@ reports: ## Run notebooks manually (open in Jupyter) and write to reports/ & rep
 
 # ===== Convenience =====
 .PHONY: all attention-workflow cross-modal-workflow clean
-all: camus acdc splits seg2d seg3d-ed oof-all features-geom features-camus labels diag-geom diag-attention diag-cross-modal results-md ## End-to-end (heavy)
+all: camus acdc splits seg2d seg3d-ed seg3d-es oof-all features-geom features-camus labels diag-geom diag-attention-all diag-cross-modal results-md ## End-to-end (heavy)
 attention-workflow: features-geom diag-attention results-md ## Attention-based classification workflow (geometric features + training + summary)
 cross-modal-workflow: features-camus diag-cross-modal cross-modal-summary ## Cross-modal fusion workflow (CAMUS features + training + summary)
 clean: ## Remove logs and reports

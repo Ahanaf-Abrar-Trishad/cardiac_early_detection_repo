@@ -876,7 +876,7 @@ def run_fold_seg_3d(tr_idxs, va_idxs, phase, logdir, args, fold_idx):
         # save best
         if dice_v > best_dice:
             best_dice = dice_v
-            best_path = logdir / f"seg_acdc_fold{fold_idx}_best.pt"
+            best_path = logdir / f"seg_acdc_{args.phase}_fold{fold_idx}_best.pt"
             torch.save(model.state_dict(), best_path)
 
         # --- NEW: log accuracy and F1 ---
