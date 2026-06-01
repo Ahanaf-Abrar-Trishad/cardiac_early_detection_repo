@@ -82,28 +82,31 @@ def run_oof(meta, phase, folds, feat3d, logdir, ckpt_pattern, oof_dir, batch_siz
         model.load_state_dict(state)
         model.eval()
         use_amp = bool(amp) and DEVICE == "cuda"
-        amp_ctx = (torch.amp.autocast(device_type="cuda") if use_amp else torch.no_grad())
 
-        # infer
-        for b, batch in enumerate(loader):
+        # infer — no_grad always applied; autocast enabled only when AMP requested
+        sample_ptr = 0
+        for batch in loader:
             x = batch["image"].to(DEVICE)
-            # Recover the dataset index for metadata
-            ds_idx = va_idxs[b] if b < len(va_idxs) else None
-            row_meta = base.df.iloc[ds_idx]
-            study_id = row_meta["study_id"]; patient_id = row_meta["patient_id"]
-            ref_path = json.loads(row_meta["paths"])[f"nii_image_{phase}"]
+            bs = x.shape[0]
+            with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                lg = model(x)  # [B,C,D,H,W]
 
-            with (amp_ctx if use_amp else torch.no_grad()):
-                lg = model(x)  # [1,C,D,H,W]
-                pred = torch.argmax(lg, dim=1, keepdim=False).cpu().numpy()[0]  # [D,H,W] in {0..C-1}
+            for i in range(bs):
+                ds_idx = va_idxs[sample_ptr] if sample_ptr < len(va_idxs) else None
+                sample_ptr += 1
+                row_meta = base.df.iloc[ds_idx]
+                study_id = row_meta["study_id"]; patient_id = row_meta["patient_id"]
+                ref_path = json.loads(row_meta["paths"])[f"nii_image_{phase}"]
 
-            out_path = oof_dir / f"{study_id}_{phase}_oof.nii.gz"
-            save_nifti_pred(pred, ref_path, out_path)
+                pred = torch.argmax(lg[i:i+1], dim=1, keepdim=False).cpu().numpy()[0]  # [D,H,W]
 
-            rows.append({
-                "fold": fold, "phase": phase, "study_id": study_id, "patient_id": patient_id,
-                "pred_path": str(out_path), "ref_img": ref_path
-            })
+                out_path = oof_dir / f"{study_id}_{phase}_oof.nii.gz"
+                save_nifti_pred(pred, ref_path, out_path)
+
+                rows.append({
+                    "fold": fold, "phase": phase, "study_id": study_id, "patient_id": patient_id,
+                    "pred_path": str(out_path), "ref_img": ref_path
+                })
 
     out_csv = Path("results") / f"acdc_oof_index_{phase}.csv"
     out_csv.parent.mkdir(parents=True, exist_ok=True)

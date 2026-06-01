@@ -2,6 +2,7 @@
 """
 Training script for Cross-Modal Attention Fusion Classifier.
 Trains the model to fuse MRI and Echo features using multi-head attention.
+Uses 5-fold GroupKFold cross-validation keyed on patient_id to prevent leakage.
 """
 import torch
 import torch.nn as nn
@@ -11,12 +12,86 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import json
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import (
+    classification_report, confusion_matrix,
+    accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score
+)
+from sklearn.model_selection import GroupKFold
 import matplotlib.pyplot as plt
 import seaborn as sns
 import sys
 sys.path.append('..')
 from models.cross_modal_fusion import CrossModalFusionClassifier, CrossModalDataset, create_cross_modal_dataset
+
+ACDC_CLASSES = ['NOR', 'DCM', 'HCM', 'MINF', 'RV']
+
+
+def _train_one_fold(model, train_loader, val_loader, device, num_epochs, learning_rate,
+                    weight_decay, patience, save_path, fold):
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
+
+    best_val_loss = float('inf')
+    best_state = None
+    patience_counter = 0
+    history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
+
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss, train_correct, train_total = 0.0, 0, 0
+        for batch in train_loader:
+            mri_f = batch['mri_features'].to(device)
+            echo_f = batch['echo_features'].to(device)
+            labels = batch['label'].to(device)
+            optimizer.zero_grad()
+            out = model(mri_f, echo_f)
+            loss = criterion(out, labels)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+            train_correct += out.argmax(1).eq(labels).sum().item()
+            train_total += labels.size(0)
+        train_loss /= len(train_loader)
+        train_acc = 100.0 * train_correct / train_total
+
+        model.eval()
+        val_loss, val_correct, val_total = 0.0, 0, 0
+        with torch.no_grad():
+            for batch in val_loader:
+                mri_f = batch['mri_features'].to(device)
+                echo_f = batch['echo_features'].to(device)
+                labels = batch['label'].to(device)
+                out = model(mri_f, echo_f)
+                val_loss += criterion(out, labels).item()
+                val_correct += out.argmax(1).eq(labels).sum().item()
+                val_total += labels.size(0)
+        val_loss /= len(val_loader)
+        val_acc = 100.0 * val_correct / val_total
+
+        scheduler.step(val_loss)
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['train_acc'].append(train_acc)
+        history['val_acc'].append(val_acc)
+
+        print(f"  Epoch {epoch+1:2d}/{num_epochs} | "
+              f"Train: {train_loss:.4f}/{train_acc:.1f}% | "
+              f"Val: {val_loss:.4f}/{val_acc:.1f}%")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"  Early stopping at epoch {epoch+1}")
+                break
+
+    model.load_state_dict(best_state)
+    return model, history
+
 
 def train_cross_modal_fusion(
     num_epochs=50,
@@ -24,266 +99,154 @@ def train_cross_modal_fusion(
     learning_rate=1e-3,
     weight_decay=1e-4,
     patience=10,
+    n_folds=5,
     save_path='logs/cross_modal_fusion'
 ):
     """
-    Train the cross-modal attention fusion classifier.
-
-    Args:
-        num_epochs: Number of training epochs
-        batch_size: Batch size for training
-        learning_rate: Learning rate for optimizer
-        weight_decay: Weight decay for regularization
-        patience: Early stopping patience
-        save_path: Path to save model and logs
+    Train the cross-modal attention fusion classifier with n-fold GroupKFold CV.
+    GroupKFold ensures no patient leaks across train/val splits.
     """
-    print("🔄 Training Cross-Modal Attention Fusion Classifier")
+    print("Training Cross-Modal Attention Fusion Classifier")
     print("=" * 60)
 
-    # Set random seeds for reproducibility
-    torch.manual_seed(42)
+    import random as _random
+    _random.seed(42)
     np.random.seed(42)
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-    # Create save directory
     save_path = Path(save_path)
     save_path.mkdir(parents=True, exist_ok=True)
 
-    # Load and prepare data
-    print("📊 Loading cross-modal datasets...")
+    print("Loading cross-modal datasets...")
     mri_df, echo_df, mri_cols, echo_cols = create_cross_modal_dataset()
 
-    # Create train/val splits (stratified by MRI labels)
-    from sklearn.model_selection import train_test_split
-    train_mri, val_mri = train_test_split(
-        mri_df, test_size=0.2, random_state=42, stratify=mri_df['label_enc']
-    )
+    if 'patient_id' not in mri_df.columns:
+        raise KeyError("mri_df must have a 'patient_id' column for GroupKFold.")
 
-    # Create datasets
-    train_dataset = CrossModalDataset(train_mri, echo_df, mri_cols, echo_cols, fit_scaler=True)
-    val_dataset = CrossModalDataset(val_mri, echo_df, mri_cols, echo_cols,
-                                   scaler=train_dataset.get_scalers(), fit_scaler=False)
-
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-
-    print(f"Train samples: {len(train_dataset)}")
-    print(f"Validation samples: {len(val_dataset)}")
-
-    # Create model
-    model = CrossModalFusionClassifier(
-        mri_dim=len(mri_cols),
-        echo_dim=len(echo_cols),
-        num_classes=5,
-        hidden_dim=128,
-        num_heads=8,
-        dropout=0.3
-    )
-
-    # Move to GPU if available
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
     print(f"Using device: {device}")
 
-    # Loss function and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
+    num_classes = mri_df['label_enc'].nunique()
+    groups = mri_df['patient_id'].values
+    y = mri_df['label_enc'].values
 
-    # Training tracking
-    best_val_loss = float('inf')
-    best_epoch = 0
-    patience_counter = 0
-    history = {
-        'train_loss': [], 'val_loss': [],
-        'train_acc': [], 'val_acc': []
-    }
+    gkf = GroupKFold(n_splits=n_folds)
 
-    print("\n🚀 Starting training...")
-    for epoch in range(num_epochs):
-        # Training phase
-        model.train()
-        train_loss = 0.0
-        train_correct = 0
-        train_total = 0
+    fold_metrics = []
+    oof_probs = np.zeros((len(mri_df), num_classes))
+    oof_labels = np.zeros(len(mri_df), dtype=int)
+    all_histories = []
 
-        for batch in train_loader:
-            mri_features = batch['mri_features'].to(device)
-            echo_features = batch['echo_features'].to(device)
-            labels = batch['label'].to(device)
+    for fold, (train_idx, val_idx) in enumerate(gkf.split(mri_df, y, groups), 1):
+        print(f"\n{'='*60}")
+        print(f"Fold {fold}/{n_folds} | train={len(train_idx)} val={len(val_idx)}")
+        assert len(set(groups[train_idx]) & set(groups[val_idx])) == 0, \
+            "Patient leakage detected — patient appears in both train and val!"
 
-            optimizer.zero_grad()
-            outputs = model(mri_features, echo_features)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+        train_mri = mri_df.iloc[train_idx].reset_index(drop=True)
+        val_mri   = mri_df.iloc[val_idx].reset_index(drop=True)
 
-            train_loss += loss.item()
-            _, predicted = outputs.max(1)
-            train_total += labels.size(0)
-            train_correct += predicted.eq(labels).sum().item()
+        train_ds = CrossModalDataset(train_mri, echo_df, mri_cols, echo_cols, fit_scaler=True)
+        val_ds   = CrossModalDataset(val_mri,   echo_df, mri_cols, echo_cols,
+                                     scaler=train_ds.get_scalers(), fit_scaler=False)
 
-        train_loss /= len(train_loader)
-        train_acc = 100. * train_correct / train_total
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
 
-        # Validation phase
+        model = CrossModalFusionClassifier(
+            mri_dim=len(mri_cols),
+            echo_dim=len(echo_cols),
+            num_classes=num_classes,
+            hidden_dim=128,
+            num_heads=8,
+            dropout=0.3
+        ).to(device)
+
+        model, history = _train_one_fold(
+            model, train_loader, val_loader, device,
+            num_epochs, learning_rate, weight_decay, patience,
+            save_path, fold
+        )
+        all_histories.append(history)
+
+        torch.save({
+            'fold': fold,
+            'model_state_dict': model.state_dict(),
+            'scalers': train_ds.get_scalers(),
+        }, save_path / f'fold{fold}_best.pt')
+
+        # Collect OOF predictions
         model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-
+        fold_preds, fold_labels, fold_probs_list = [], [], []
         with torch.no_grad():
             for batch in val_loader:
-                mri_features = batch['mri_features'].to(device)
-                echo_features = batch['echo_features'].to(device)
-                labels = batch['label'].to(device)
+                mri_f  = batch['mri_features'].to(device)
+                echo_f = batch['echo_features'].to(device)
+                lbls   = batch['label'].to(device)
+                out    = model(mri_f, echo_f)
+                probs  = torch.softmax(out, dim=1).cpu().numpy()
+                fold_probs_list.append(probs)
+                fold_preds.extend(out.argmax(1).cpu().numpy())
+                fold_labels.extend(lbls.cpu().numpy())
 
-                outputs = model(mri_features, echo_features)
-                loss = criterion(outputs, labels)
+        fold_probs_arr = np.vstack(fold_probs_list)
+        oof_probs[val_idx]  = fold_probs_arr
+        oof_labels[val_idx] = fold_labels
 
-                val_loss += loss.item()
-                _, predicted = outputs.max(1)
-                val_total += labels.size(0)
-                val_correct += predicted.eq(labels).sum().item()
+        acc  = accuracy_score(fold_labels, fold_preds)
+        bacc = balanced_accuracy_score(fold_labels, fold_preds)
+        mf1  = f1_score(fold_labels, fold_preds, average='macro', zero_division=0)
+        try:
+            auc = roc_auc_score(fold_labels, fold_probs_arr,
+                                multi_class='ovr', average='macro')
+        except Exception:
+            auc = float('nan')
+        fold_metrics.append({'fold': fold, 'acc': acc, 'bacc': bacc, 'f1_macro': mf1, 'auc': auc})
+        print(f"  Fold {fold} | Acc={acc:.3f} BalAcc={bacc:.3f} F1={mf1:.3f} AUC={auc:.3f}")
 
-        val_loss /= len(val_loader)
-        val_acc = 100. * val_correct / val_total
+    # Aggregate OOF results
+    print(f"\n{'='*60}")
+    print("Cross-Validation Summary (OOF):")
+    metrics_df = pd.DataFrame(fold_metrics)
+    for col in ['acc', 'bacc', 'f1_macro', 'auc']:
+        print(f"  {col:10s}: {metrics_df[col].mean():.3f} ± {metrics_df[col].std():.3f}")
 
-        # Update learning rate
-        scheduler.step(val_loss)
+    metrics_df.to_csv(save_path / 'cv_metrics.csv', index=False)
 
-        # Track history
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
-        history['train_acc'].append(train_acc)
-        history['val_acc'].append(val_acc)
+    # Full OOF classification report with correct ACDC class names
+    oof_preds = oof_probs.argmax(axis=1)
+    print("\nOOF Classification Report:")
+    print(classification_report(oof_labels, oof_preds,
+                                target_names=ACDC_CLASSES[:num_classes]))
 
-        print(f"Epoch {epoch+1:2d}/{num_epochs} | "
-              f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}% | "
-              f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
-
-        # Early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_epoch = epoch
-            patience_counter = 0
-
-            # Save best model
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_loss,
-                'val_acc': val_acc,
-                'scalers': train_dataset.get_scalers()
-            }, save_path / 'best_model.pt')
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"\n⏹️  Early stopping at epoch {epoch+1}")
-                break
-
-    print(f"\n✅ Training completed! Best epoch: {best_epoch+1}, Best val loss: {best_val_loss:.4f}")
-
-    # Load best model for evaluation
-    checkpoint = torch.load(save_path / 'best_model.pt', weights_only=False)
-    model.load_state_dict(checkpoint['model_state_dict'])
-
-    # Final evaluation
-    print("\n📊 Final Evaluation:")
-    evaluate_model(model, val_loader, device, save_path)
-
-    # Save training history
-    with open(save_path / 'training_history.json', 'w') as f:
-        json.dump(history, f, indent=2)
-
-    # Plot training curves
-    plot_training_history(history, save_path)
-
-    return model, history
-
-
-def evaluate_model(model, val_loader, device, save_path):
-    """Evaluate model and generate detailed metrics"""
-    model.eval()
-    all_preds = []
-    all_labels = []
-
-    with torch.no_grad():
-        for batch in val_loader:
-            mri_features = batch['mri_features'].to(device)
-            echo_features = batch['echo_features'].to(device)
-            labels = batch['label'].to(device)
-
-            outputs = model(mri_features, echo_features)
-            _, predicted = outputs.max(1)
-
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-    # Classification report
-    target_names = ['NOR', 'MIN', 'MR', 'MS', 'AR']
-    report = classification_report(all_labels, all_preds, target_names=target_names, output_dict=True)
-
-    print("Classification Report:")
-    print(classification_report(all_labels, all_preds, target_names=target_names))
-
-    # Confusion matrix
-    cm = confusion_matrix(all_labels, all_preds)
+    # OOF confusion matrix
+    cm = confusion_matrix(oof_labels, oof_preds)
     plt.figure(figsize=(8, 6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=target_names, yticklabels=target_names)
-    plt.title('Cross-Modal Fusion Confusion Matrix')
+                xticklabels=ACDC_CLASSES[:num_classes],
+                yticklabels=ACDC_CLASSES[:num_classes])
+    plt.title('Cross-Modal Fusion — OOF Confusion Matrix')
     plt.ylabel('True Label')
     plt.xlabel('Predicted Label')
     plt.tight_layout()
-    plt.savefig(save_path / 'confusion_matrix.png', dpi=300, bbox_inches='tight')
+    plt.savefig(save_path / 'oof_confusion_matrix.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-    # Save detailed metrics
-    with open(save_path / 'evaluation_metrics.json', 'w') as f:
-        json.dump(report, f, indent=2)
-
-    return report
-
-
-def plot_training_history(history, save_path):
-    """Plot training and validation curves"""
-    fig, ((ax1, ax2)) = plt.subplots(1, 2, figsize=(15, 5))
-
-    # Loss curves
-    ax1.plot(history['train_loss'], label='Train Loss')
-    ax1.plot(history['val_loss'], label='Val Loss')
-    ax1.set_title('Training and Validation Loss')
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Loss')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-
-    # Accuracy curves
-    ax2.plot(history['train_acc'], label='Train Accuracy')
-    ax2.plot(history['val_acc'], label='Val Accuracy')
-    ax2.set_title('Training and Validation Accuracy')
-    ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Accuracy (%)')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(save_path / 'training_curves.png', dpi=300, bbox_inches='tight')
-    plt.close()
+    return metrics_df, all_histories
 
 
 if __name__ == "__main__":
-    # Train the cross-modal fusion model
-    model, history = train_cross_modal_fusion(
+    metrics_df, histories = train_cross_modal_fusion(
         num_epochs=50,
         batch_size=32,
         learning_rate=1e-3,
+        n_folds=5,
         save_path='logs/cross_modal_fusion'
     )
-
-    print("\n🎉 Cross-Modal Attention Fusion training completed!")
-    print("Model saved to: logs/cross_modal_fusion/best_model.pt")
-    print("Training history: logs/cross_modal_fusion/training_history.json")
-    print("Evaluation metrics: logs/cross_modal_fusion/evaluation_metrics.json")
+    print("\nCross-Modal Attention Fusion training completed.")
+    print("Fold checkpoints: logs/cross_modal_fusion/fold*_best.pt")
+    print("CV metrics:       logs/cross_modal_fusion/cv_metrics.csv")
+    print("OOF confusion:    logs/cross_modal_fusion/oof_confusion_matrix.png")

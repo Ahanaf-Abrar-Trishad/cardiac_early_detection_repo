@@ -20,7 +20,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from pathlib import Path
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score, classification_report
 from torch.utils.data import Dataset, DataLoader
@@ -453,21 +453,22 @@ def main(argv=None):
     num_classes = len(le.classes_)
     print(f"Classes ({num_classes}): {list(le.classes_)}")
     
-    # Cross-validation setup
-    skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
-    
+    # Cross-validation setup — GroupKFold ensures no patient leaks across folds
+    gkf = GroupKFold(n_splits=args.folds)
+    groups = df["patient_id"].values
+
     fold_metrics = []
     oof_probs = np.zeros((len(df), num_classes))  # Out-of-fold predictions
     oof_labels = np.zeros(len(df))
-    
+
     logdir = Path(args.logdir)
     logdir.mkdir(exist_ok=True)
-    
+
     # Save out-of-fold predictions directory
     oof_dir = logdir / "oof_preds"
     oof_dir.mkdir(exist_ok=True)
-    
-    for fold, (train_idx, val_idx) in enumerate(skf.split(df, df["label_enc"]), 1):
+
+    for fold, (train_idx, val_idx) in enumerate(gkf.split(df, df["label_enc"], groups), 1):
         print(f"\n{'='*80}")
         print(f"Fold {fold}/{args.folds}")
         print(f"{'='*80}")
@@ -496,24 +497,28 @@ def main(argv=None):
         # Handle missing values with imputation
         imputer = SimpleImputer(strategy='median')
         X_train_imputed = imputer.fit_transform(X_train)
-        
+
+        # Fit scaler on real patients BEFORE SMOTE so synthetic samples don't bias statistics
+        pre_smote_scaler = StandardScaler().fit(X_train_imputed)
+
         # Apply SMOTE
         min_samples = min(Counter(y_train).values())
         k_neighbors = min(5, max(1, min_samples - 1))
         smote = SMOTE(random_state=args.seed, k_neighbors=k_neighbors)
         X_train_balanced, y_train_balanced = smote.fit_resample(X_train_imputed, y_train)
-        
+
         # Create balanced training dataframe
         train_df_balanced = pd.DataFrame(X_train_balanced, columns=valid_feat_cols)
         train_df_balanced['label_enc'] = y_train_balanced
         train_df_balanced['patient_id'] = [f"smote_{i}" for i in range(len(train_df_balanced))]
-        
+
         print(f"Balanced training class distribution: {Counter(y_train_balanced)}")
         print(f"Train: {len(train_df_balanced)} patients (after SMOTE) | Val: {len(val_df)} patients")
-        
-        # Create datasets and loaders
+
+        # Create datasets and loaders — pass pre-SMOTE scaler so transform uses real-patient stats
         if args.model_type == 'advanced':
-            train_dataset = SingleInputDataset(train_df_balanced, all_feat_cols, fit_scaler=True)
+            train_dataset = SingleInputDataset(train_df_balanced, all_feat_cols,
+                                               scaler=pre_smote_scaler, fit_scaler=False)
             scaler = train_dataset.get_scaler()
             val_dataset = SingleInputDataset(val_df, all_feat_cols, scaler=scaler)
             model = AdvancedAttentionClassifier(
@@ -526,7 +531,13 @@ def main(argv=None):
                 dropout=args.dropout
             ).to(args.device)
         elif args.model_type == 'multimodal':
-            train_dataset = MultiModalDataset(train_df_balanced, geo_cols, ef_cols, fit_scaler=True)
+            # Fit separate geo/func scalers on pre-SMOTE data
+            pre_smote_scaler_mm = {
+                'geo':  StandardScaler().fit(train_df[geo_cols].values.astype(np.float32)),
+                'func': StandardScaler().fit(train_df[ef_cols].values.astype(np.float32)),
+            }
+            train_dataset = MultiModalDataset(train_df_balanced, geo_cols, ef_cols,
+                                              scaler=pre_smote_scaler_mm, fit_scaler=False)
             scaler = train_dataset.get_scalers()
             val_dataset = MultiModalDataset(val_df, geo_cols, ef_cols, scaler=scaler)
             model = MultiModalAttentionClassifier(

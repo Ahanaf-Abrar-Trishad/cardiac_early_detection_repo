@@ -980,7 +980,8 @@ def main():
 
     # Reproducibility + perf niceties
     set_all_seeds(args.seed)
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     try:
         torch.set_float32_matmul_precision("high")  # TF32 on Ada/Ampere
     except Exception:

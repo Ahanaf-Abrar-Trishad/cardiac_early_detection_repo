@@ -87,8 +87,14 @@ def main():
         if not gE_path: continue
         gE = nib.load(gE_path).get_fdata().astype(np.int16)
 
-        perm = best_mapping(vE, gE, 4)
-        vE = perm[vE]; vS = perm[vS]
+        gS_path = path_map.get(sidS,{}).get("nii_mask_ES","")
+        perm_ED = best_mapping(vE, gE, 4)
+        if gS_path:
+            gS = nib.load(gS_path).get_fdata().astype(np.int16)
+            perm_ES = best_mapping(vS, gS, 4)
+            if not np.array_equal(perm_ED, perm_ES):
+                print(f"Warning: {pid} ED perm {perm_ED} != ES perm {perm_ES} — using ED perm")
+        vE = perm_ED[vE]; vS = perm_ED[vS]
         vE = clean_labels(vE); vS = clean_labels(vS)
 
         spE = voxel_sizes(r["pred_path"]); spS = voxel_sizes(es.loc[pid,"pred_path"])
