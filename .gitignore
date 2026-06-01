@@ -1,0 +1,55 @@
+# Virtual environments
+venv_wsl/
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Model weights and checkpoints
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# Medical imaging data (use DVC or external storage for these)
+*.nii.gz
+*.nii
+*.dcm
+*.mhd
+*.mha
+
+# Generated images and previews
+logs/runs/
+*.png
+*.jpg
+*.jpeg
+
+# Backup files
+*.backup
+*.bak
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+
+# Experiment tracking local artifacts
+mlruns/
+wandb/
+
+# Build artifacts
+*.egg-info/
+dist/
+build/

@@ -1,0 +1,22 @@
+name: cardio-dl
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - git
+  - cmake
+  - ninja
+  - pkg-config
+  - ffmpeg
+  - libjpeg-turbo
+  - libpng
+  - libtiff
+  - libopenblas
+  - xgboost
+  # NOTE: PyTorch is intentionally NOT pinned here.
+  # Install it separately per your CUDA setup, e.g.:
+  #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+  - pip:
+      - -r requirements.txt
+      - tabulate>=0.9

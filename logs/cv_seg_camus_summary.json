@@ -1,0 +1,23 @@
+{
+  "Dice_mean": 0.9470069682462279,
+  "Dice_std": 0.0022707895429692087,
+  "IoU_mean": 0.9005776740203373,
+  "IoU_std": 0.003981890023306198,
+  "Accuracy_mean": 0.9748954772949219,
+  "Accuracy_std": 0.0008590004631043149,
+  "F1_macro_mean": 0.9660626451765433,
+  "F1_macro_std": 0.0011703816790892322,
+  "F1_weighted_mean": 0.974884077901662,
+  "F1_weighted_std": 0.0008709761158651063,
+  "folds": 5,
+  "dataset": "camus",
+  "phase": "ED",
+  "view": "4CH",
+  "feat2d": "32,64,128,256",
+  "feat3d": "",
+  "amp": true,
+  "grad_clip": 1.0,
+  "accum": 1,
+  "num_workers": 4,
+  "model": "unet"
+}
