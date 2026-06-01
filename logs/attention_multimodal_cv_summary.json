@@ -1,0 +1,124 @@
+{
+  "model_type": "multimodal",
+  "args": {
+    "features": "results/acdc_oof_features_geom.csv",
+    "folds": 5,
+    "seed": 42,
+    "model_type": "multimodal",
+    "hidden_dim": 256,
+    "num_blocks": 4,
+    "num_heads": 8,
+    "mlp_ratio": 4.0,
+    "dropout": 0.3,
+    "tt_d_model": 128,
+    "tt_depth": 4,
+    "tt_heads": 8,
+    "tt_dropout": 0.3,
+    "graph_hidden": 128,
+    "graph_heads": 4,
+    "graph_layers": 2,
+    "graph_dropout": 0.2,
+    "epochs": 100,
+    "batch_size": 16,
+    "lr": 0.0005,
+    "weight_decay": 0.0001,
+    "patience": 30,
+    "device": "cuda",
+    "logdir": "logs",
+    "verbose": false
+  },
+  "num_params": 1363205,
+  "fold_metrics": [
+    {
+      "fold": 1,
+      "acc": 0.4,
+      "bal_acc": 0.39499999999999996,
+      "f1_macro": 0.40586080586080586,
+      "f1_weighted": 0.4385022385022385,
+      "auc": 0.0,
+      "best_epoch": 28
+    },
+    {
+      "fold": 2,
+      "acc": 0.6,
+      "bal_acc": 0.6076190476190476,
+      "f1_macro": 0.6138579067990833,
+      "f1_weighted": 0.6271759612936083,
+      "auc": 0.0,
+      "best_epoch": 20
+    },
+    {
+      "fold": 3,
+      "acc": 0.4,
+      "bal_acc": 0.375,
+      "f1_macro": 0.3384242424242424,
+      "f1_weighted": 0.3747878787878787,
+      "auc": 0.0,
+      "best_epoch": 42
+    },
+    {
+      "fold": 4,
+      "acc": 0.5666666666666667,
+      "bal_acc": 0.5466666666666666,
+      "f1_macro": 0.5255555555555556,
+      "f1_weighted": 0.5348148148148149,
+      "auc": 0.0,
+      "best_epoch": 9
+    },
+    {
+      "fold": 5,
+      "acc": 0.6666666666666666,
+      "bal_acc": 0.6714285714285714,
+      "f1_macro": 0.6458152958152958,
+      "f1_weighted": 0.6493025493025493,
+      "auc": 0.0,
+      "best_epoch": 9
+    }
+  ],
+  "summary_stats": {
+    "acc": {
+      "mean": 0.5266666666666666,
+      "std": 0.10832051206181278,
+      "ci95_lower": 0.3762936889133973,
+      "ci95_upper": 0.6770396444199359
+    },
+    "bal_acc": {
+      "mean": 0.5191428571428571,
+      "std": 0.11658914820195766,
+      "ci95_lower": 0.35729117222060436,
+      "ci95_upper": 0.6809945420651099
+    },
+    "f1_macro": {
+      "mean": 0.5059027612909965,
+      "std": 0.11804533892465935,
+      "ci95_lower": 0.3420295595666041,
+      "ci95_upper": 0.669775963015389
+    },
+    "f1_weighted": {
+      "mean": 0.5249166885402179,
+      "std": 0.10586112678259828,
+      "ci95_lower": 0.3779578848970839,
+      "ci95_upper": 0.6718754921833519
+    },
+    "auc": {
+      "mean": 0.0,
+      "std": 0.0,
+      "ci95_lower": NaN,
+      "ci95_upper": NaN
+    }
+  },
+  "oof_metrics": {
+    "acc": 0.5266666666666666,
+    "bal_acc": 0.5266666666666667,
+    "f1_macro": 0.5174057524396507,
+    "f1_weighted": 0.5174057524396507,
+    "auc": 0.0
+  },
+  "classes": [
+    "DCM",
+    "HCM",
+    "MINF",
+    "NOR",
+    "RV"
+  ]
+}
